@@ -1,0 +1,81 @@
+name: "Infrastructure Cleanup"
+
+on:
+  workflow_dispatch: # This enables the manual "Big Red Button"
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_CLOUD_ORGANIZATION: "DigitalTech"
+  TF_WORKSPACE: "asg-incid"
+  AWS_REGION: "us-east-1"
+  SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+jobs:
+  terraform-destroy:
+    name: "Controlled Infrastructure Teardown"
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: Slack Notification - Destruction Complete
+        if: success()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_COLOR: '#FF9900'
+          SLACK_MESSAGE: "✅ Started Infrastructure Teardown Successfully ..."
+          SLACK_TITLE: "Infrastructure Teardown Status: SUCCESS"  
+
+      - name: Configure AWS Credentials (OIDC)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: GitHubActions-${{ github.run_id }}      
+
+      - run: terraform init
+
+      # Step 1: Generate the plan for destruction so we know WHAT is being deleted
+      - name: Terraform Destroy Plan
+        run: terraform plan -destroy -out=destroy.tfplan
+
+      # Step 2: Execute the destruction
+      - name: Terraform Destroy Apply
+        run: terraform apply -auto-approve destroy.tfplan
+
+      # Step 3: Send the "Infrastructure Destroyed" Alert
+      - name: Slack Notification - Destruction Complete
+        if: success()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_COLOR: '#FF9900' 
+          SLACK_TITLE: "⚠️ INFRASTRUCTURE DESTROYED"
+          SLACK_MESSAGE: |
+            *Alert:* The Cloud environment has been successfully torn down.
+            *Environment:* Production
+            *Action:* Terraform Destroy
+            *Triggered By:* ${{ github.actor }}
+            *Result:* Monthly AWS costs reduced to $0.
+          SLACK_FOOTER: "Cleanup Complete - State Refreshed"
+
+      # Step 4: Handle Failure Alert
+      - name: Slack Notification - Destruction Failed
+        if: failure()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_COLOR: 'danger'
+          SLACK_TITLE: "🚨 DESTROY FAILED"
+          SLACK_MESSAGE: |
+            *Error:* Terraform was unable to fully destroy the resources.
+            *Action Required:* Check AWS Console for "Zombie" resources to avoid billing.
+            *Logs:* https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}  

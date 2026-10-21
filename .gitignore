@@ -1,0 +1,14 @@
+# Terraform local state and backups
+*.tfstate
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+
+# Variables (Where your secrets live)
+*.tfvars
+
+*.md
+# Generated Lambda deployment packages
+*.zip
+__pycache__/
+*.py[cod]
