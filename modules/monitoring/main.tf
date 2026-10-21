@@ -157,10 +157,10 @@ resource "aws_cloudwatch_metric_alarm" "high_memory_alarm" {
   threshold           = var.memory_alarm_threshold
   alarm_description   = "Memory usage across the Auto Scaling Group exceeds the configured threshold."
   treat_missing_data  = "missing"
-  dimensions = { AutoScalingGroupName = var.asg_name }
-  alarm_actions = [aws_sns_topic.cloudwatch_alarms_topic.arn]
-  ok_actions    = [aws_sns_topic.cloudwatch_alarms_topic.arn]
-  tags = merge(var.tags, { Name = "${var.env_prefix}-ASG-High-Memory-Alarm" })
+  dimensions          = { AutoScalingGroupName = var.asg_name }
+  alarm_actions       = [aws_sns_topic.cloudwatch_alarms_topic.arn]
+  ok_actions          = [aws_sns_topic.cloudwatch_alarms_topic.arn]
+  tags                = merge(var.tags, { Name = "${var.env_prefix}-ASG-High-Memory-Alarm" })
 }
 
 resource "aws_cloudwatch_metric_alarm" "unhealthy_alb_alarm" {
@@ -181,7 +181,7 @@ resource "aws_cloudwatch_metric_alarm" "unhealthy_alb_alarm" {
   }
   alarm_actions = [aws_sns_topic.cloudwatch_alarms_topic.arn]
   ok_actions    = [aws_sns_topic.cloudwatch_alarms_topic.arn]
-  tags = merge(var.tags, { Name = "${var.env_prefix}-ALB-Unhealthy-Targets" })
+  tags          = merge(var.tags, { Name = "${var.env_prefix}-ALB-Unhealthy-Targets" })
 }
 
 # --- HIGH DISK UTILIZATION ALARM ---

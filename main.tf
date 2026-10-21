@@ -150,11 +150,11 @@ module "logging" {
   env_prefix                 = var.env_prefix
   default_log_retention_days = var.default_log_retention_days
   # The monitoring module owns the canonical web_app log group used by its error metric filter.
-  log_groups = { for key, value in var.log_groups : key => value if key != "web_app" }
-  metric_filters = { for key, value in var.metric_filters : key => value if value.log_group_key != "web_app" }
-  app_alarms                 = var.app_alarms
-  alarm_sns_topic_arns       = [module.monitoring.cloudwatch_alarms_topic_arn]
-  tags                       = local.common_tags
+  log_groups           = { for key, value in var.log_groups : key => value if key != "web_app" }
+  metric_filters       = { for key, value in var.metric_filters : key => value if value.log_group_key != "web_app" }
+  app_alarms           = var.app_alarms
+  alarm_sns_topic_arns = [module.monitoring.cloudwatch_alarms_topic_arn]
+  tags                 = local.common_tags
 }
 
 # ==============================================================================
@@ -162,10 +162,10 @@ module "logging" {
 # ==============================================================================
 
 module "monitoring" {
-  source           = "./modules/monitoring"
-  env_prefix       = var.env_prefix
-  asg_name         = module.webserver.asg_name
-  target_group_arn = module.alb.target_group_arn
+  source                   = "./modules/monitoring"
+  env_prefix               = var.env_prefix
+  asg_name                 = module.webserver.asg_name
+  target_group_arn         = module.alb.target_group_arn
   slack_webhook_secret_arn = var.slack_webhook_secret_arn
   alert_email              = var.alert_email
   app_log_group_name       = "/aws/${var.env_prefix}/web_app"
