@@ -68,7 +68,6 @@ resource "aws_iam_role_policy" "worker_policy" {
       { Effect = "Allow", Action = ["elasticloadbalancing:DescribeTargetHealth"], Resource = "*" },
       { Effect = "Allow", Action = ["autoscaling:DescribeAutoScalingGroups", "autoscaling:TerminateInstanceInAutoScalingGroup"], Resource = "*" },
       { Effect = "Allow", Action = ["ec2:DescribeInstances"], Resource = "*" },
-      { Effect = "Allow", Action = ["secretsmanager:GetSecretValue"], Resource = var.slack_webhook_secret_arn },
       { Effect = "Allow", Action = ["sqs:SendMessage"], Resource = aws_sqs_queue.worker_failure_dlq.arn }
     ]
   })
@@ -104,7 +103,7 @@ resource "aws_lambda_function" "remediation_worker" {
   environment {
     variables = {
       INCIDENT_TABLE_NAME          = aws_dynamodb_table.incidents.name
-      SLACK_WEBHOOK_SECRET_ARN     = var.slack_webhook_secret_arn
+      SLACK_WEBHOOK_URL            = var.slack_webhook_url
       TARGET_GROUP_ARN             = var.target_group_arn
       ASG_NAME                     = var.asg_name
       MAX_REMEDIATION_ATTEMPTS     = tostring(var.max_remediation_attempts)

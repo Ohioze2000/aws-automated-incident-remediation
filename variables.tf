@@ -88,7 +88,6 @@ variable "max_size" {
 #     error_message = "slack_webhook_secret_arn must be a Secrets Manager secret ARN."
 #   }
 # }
-
 variable "slack_webhook_url" {
   type        = string
   description = "Slack Webhook URL for CloudWatch incident alerting and remediation events"

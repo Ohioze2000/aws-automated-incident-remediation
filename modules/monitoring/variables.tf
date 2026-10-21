@@ -55,9 +55,9 @@ variable "incident_ttl_days" {
   default     = 90
 }
 
-variable "slack_webhook_secret_arn" {
+variable "slack_webhook_url" {
+  description = "Slack incoming webhook URL for monitoring and remediation notifications."
   type        = string
-  description = "Secrets Manager ARN holding the Slack incoming webhook URL"
   sensitive   = true
 }
 

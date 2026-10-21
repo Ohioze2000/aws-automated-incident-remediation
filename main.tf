@@ -160,18 +160,16 @@ module "logging" {
 # ==============================================================================
 # 7. MONITORING & AUTOMATED REMEDIATION
 # ==============================================================================
-
 module "monitoring" {
-  source                   = "./modules/monitoring"
-  env_prefix               = var.env_prefix
-  asg_name                 = module.webserver.asg_name
-  target_group_arn         = module.alb.target_group_arn
-  slack_webhook_url        = var.slack_webhook_url
-  #slack_webhook_secret_arn = var.slack_webhook_secret_arn
-  alert_email              = var.alert_email
-  app_log_group_name       = "/aws/${var.env_prefix}/web_app"
-  target_group_dimension   = element(split(":", module.alb.target_group_arn), 5)
-  load_balancer_dimension  = trimprefix(element(split(":", module.alb.alb_arn), 5), "loadbalancer/")
+  source                  = "./modules/monitoring"
+  env_prefix              = var.env_prefix
+  asg_name                = module.webserver.asg_name
+  target_group_arn        = module.alb.target_group_arn
+  slack_webhook_url       = var.slack_webhook_url
+  alert_email             = var.alert_email
+  app_log_group_name      = "/aws/${var.env_prefix}/web_app"
+  target_group_dimension  = element(split(":", module.alb.target_group_arn), 5)
+  load_balancer_dimension = trimprefix(element(split(":", module.alb.alb_arn), 5), "loadbalancer/")
 
   tags = local.common_tags
 }
