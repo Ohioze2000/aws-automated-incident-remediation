@@ -79,14 +79,20 @@ variable "max_size" {
   default     = 4
 }
 
-variable "slack_webhook_secret_arn" {
+# variable "slack_webhook_secret_arn" {
+#   type        = string
+#   description = "ARN of a Secrets Manager secret containing the Slack incoming webhook URL"
+#   sensitive   = true
+#   validation {
+#     condition     = can(regex("^arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:.+", var.slack_webhook_secret_arn))
+#     error_message = "slack_webhook_secret_arn must be a Secrets Manager secret ARN."
+#   }
+# }
+
+variable "slack_webhook_url" {
   type        = string
-  description = "ARN of a Secrets Manager secret containing the Slack incoming webhook URL"
+  description = "Slack Webhook URL for CloudWatch incident alerting and remediation events"
   sensitive   = true
-  validation {
-    condition     = can(regex("^arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:.+", var.slack_webhook_secret_arn))
-    error_message = "slack_webhook_secret_arn must be a Secrets Manager secret ARN."
-  }
 }
 
 variable "alert_email" {
