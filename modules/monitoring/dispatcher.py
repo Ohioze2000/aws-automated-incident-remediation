@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+import urllib.request
 from datetime import datetime, timezone
 
 import boto3
@@ -14,7 +15,33 @@ ddb = boto3.resource("dynamodb")
 lam = boto3.client("lambda")
 TABLE = ddb.Table(os.environ["INCIDENT_TABLE_NAME"])
 WORKER_ARN = os.environ["WORKER_FUNCTION_ARN"]
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 ENV_PREFIX = os.environ.get("ENV_PREFIX", "unknown")
+
+
+def _send_incident_alert(item):
+    """Send the initial incident alert; delivery failure must not block remediation."""
+    webhook = SLACK_WEBHOOK_URL
+    if not webhook:
+        raise RuntimeError("SLACK_WEBHOOK_URL is not configured")
+    message = (
+        "*AWS Self-Healing Incident Detected*\n"
+        f"*Incident:* `{item['incident_id']}`\n"
+        f"*Environment:* `{item['environment']}`\n"
+        f"*Signal:* `{item['signal_type']}`\n"
+        f"*Alarm:* `{item['alarm_name']}`\n"
+        f"*Resource:* `{item.get('instance_id') or 'not instance-scoped'}`\n"
+        f"*Region:* `{item['region']}`\n"
+        f"*Reason:* {item['reason']}\n"
+        "*Status:* Incident accepted; remediation decision/verification is pending."
+    )
+    request = urllib.request.Request(
+        webhook, data=json.dumps({"text": message}).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        if response.status < 200 or response.status >= 300:
+            raise RuntimeError(f"Slack webhook returned HTTP {response.status}")
 
 
 def _signal(alarm_name: str) -> str:
@@ -27,7 +54,7 @@ def _signal(alarm_name: str) -> str:
         return "disk"
     if "unhealthy" in value or "alb" in value or "target-health" in value:
         return "alb_health"
-    if "app" in value or "error" in value or "5xx" in value:
+    if any(token in value for token in ("app", "error", "5xx", "db", "timeout", "exception")):
         return "application_error"
     return "unknown"
 
@@ -101,5 +128,20 @@ def lambda_handler(event, context):
                 ExpressionAttributeValues={":s": "DISPATCH_FAILED", ":e": "Worker invocation failed", ":t": datetime.now(timezone.utc).isoformat()},
             )
             raise
+        # Initial alert is best-effort: notification failure must not block remediation.
+        try:
+            _send_incident_alert(item)
+            TABLE.update_item(
+                Key={"incident_id": incident_id},
+                UpdateExpression="SET incident_alert_status = :s, incident_alerted_at = :t",
+                ExpressionAttributeValues={":s": "DELIVERED", ":t": datetime.now(timezone.utc).isoformat()},
+            )
+        except Exception as notify_exc:
+            LOG.exception("Initial Slack alert failed for incident %s", incident_id)
+            TABLE.update_item(
+                Key={"incident_id": incident_id},
+                UpdateExpression="SET incident_alert_status = :s, incident_alert_error = :e",
+                ExpressionAttributeValues={":s": "FAILED", ":e": type(notify_exc).__name__},
+            )
         LOG.info("Incident dispatched incident_id=%s signal=%s", incident_id, item["signal_type"])
     return {"status": "accepted"}

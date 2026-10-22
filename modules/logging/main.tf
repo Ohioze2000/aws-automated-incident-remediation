@@ -7,7 +7,7 @@ resource "aws_cloudwatch_log_group" "app_log_groups" {
 
   name              = "/aws/${var.env_prefix}/${each.key}"
   retention_in_days = coalesce(each.value.retention_in_days, var.default_log_retention_days)
-  kms_key_id        = try(each.value.kms_key_id, var.kms_key_id, null)
+  kms_key_id        = try(each.value.kms_key_id, null) != null ? each.value.kms_key_id : var.kms_key_id
 
   tags = merge(
     var.tags,

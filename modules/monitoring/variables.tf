@@ -55,10 +55,24 @@ variable "incident_ttl_days" {
   default     = 90
 }
 
+
 variable "slack_webhook_url" {
-  description = "Slack incoming webhook URL for monitoring and remediation notifications."
   type        = string
+  description = "Slack incoming webhook URL provided through a sensitive HCP Terraform variable."
   sensitive   = true
+  validation {
+    condition     = startswith(var.slack_webhook_url, "https://hooks.slack.com/")
+    error_message = "slack_webhook_url must begin with https://hooks.slack.com/."
+  }
+}
+
+variable "cloudwatch_agent_parameter_name" {
+  type        = string
+  description = "SSM Parameter Store name containing the CloudWatch Agent configuration."
+  validation {
+    condition     = startswith(var.cloudwatch_agent_parameter_name, "/")
+    error_message = "cloudwatch_agent_parameter_name must begin with '/'."
+  }
 }
 
 variable "alert_email" {
@@ -77,7 +91,7 @@ variable "sns_kms_key_id" {
 variable "cpu_alarm_threshold" {
   type        = number
   description = "Average CPU threshold percent to trigger alarm"
-  default     = 80
+  default     = 70
 }
 
 variable "cpu_evaluation_periods" {
@@ -95,7 +109,7 @@ variable "cpu_datapoints_to_alarm" {
 variable "cpu_alarm_period" {
   type        = number
   description = "The period in seconds over which the specified statistic is applied"
-  default     = 300
+  default     = 120
 }
 
 # --- Disk Alarm Variables ---
@@ -121,37 +135,6 @@ variable "disk_alarm_period" {
   type        = number
   description = "Period in seconds for disk alarm evaluation"
   default     = 120
-}
-
-# --- Log Error Alarm Variables ---
-variable "enable_log_error_alarm" {
-  type        = bool
-  description = "Whether to enable application log error monitoring"
-  default     = true
-}
-
-variable "app_log_group_name" {
-  type        = string
-  description = "Name of the CloudWatch log group storing application logs"
-  default     = "/ec2/app-logs"
-}
-
-variable "log_error_pattern" {
-  type        = string
-  description = "Metric filter pattern to search for error terms in logs"
-  default     = "?ERROR ?Error ?error ?500 ?EXCEPTION ?Exception"
-}
-
-variable "log_error_threshold" {
-  type        = number
-  description = "Number of log error occurrences in period to trigger alarm"
-  default     = 5
-}
-
-variable "log_error_alarm_period" {
-  type        = number
-  description = "Evaluation window in seconds for error log frequency"
-  default     = 60
 }
 
 # --- General Variables ---

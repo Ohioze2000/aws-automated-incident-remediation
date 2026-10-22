@@ -34,6 +34,17 @@ locals {
     }
   )
 
+  # One Terraform owner for every CloudWatch log group. Override retention/KMS
+  # values through var.log_groups without duplicating the canonical web_app group.
+  default_log_groups = {
+    "cloud-init-output" = { retention_in_days = var.default_log_retention_days, kms_key_id = null }
+    "user-data"         = { retention_in_days = var.default_log_retention_days, kms_key_id = null }
+    "nginx/access"      = { retention_in_days = var.default_log_retention_days, kms_key_id = null }
+    "nginx/error"       = { retention_in_days = var.default_log_retention_days, kms_key_id = null }
+    "web_app"           = { retention_in_days = var.default_log_retention_days, kms_key_id = null }
+  }
+  effective_log_groups = merge(local.default_log_groups, var.log_groups)
+
   # Map ACM Domain Validation Options for Route 53 validation records
   cert_validation_map = {
     for dvo in module.ssl.domain_validation_options : dvo.domain_name => {
@@ -68,9 +79,10 @@ module "ssl" {
 
 module "dns" {
   source       = "./modules/dns"
-  domain_name  = var.domain_name
-  env_prefix   = var.env_prefix
-  alb_dns_name = module.alb.alb_dns_name
+  domain_name       = var.domain_name
+  env_prefix        = var.env_prefix
+  create_www_record = var.create_www_record
+  alb_dns_name      = module.alb.alb_dns_name
   alb_zone_id  = module.alb.alb_zone_id
   tags         = local.common_tags
 }
@@ -113,9 +125,10 @@ module "alb" {
 # ==============================================================================
 
 module "iam" {
-  source     = "./modules/iam"
-  env_prefix = var.env_prefix
-  tags       = local.common_tags
+  source                          = "./modules/iam"
+  env_prefix                      = var.env_prefix
+  cloudwatch_agent_parameter_name = var.cloudwatch_agent_parameter_name
+  tags                            = local.common_tags
 }
 
 # ==============================================================================
@@ -142,16 +155,16 @@ module "webserver" {
 }
 
 # ==============================================================================
-# 6. APPLICATION LOGGING & OBSERVABILITY (Moved above Monitoring)
+# 6. APPLICATION LOGGING & OBSERVABILITY
 # ==============================================================================
 
 module "logging" {
   source                     = "./modules/logging"
   env_prefix                 = var.env_prefix
   default_log_retention_days = var.default_log_retention_days
-  # The monitoring module owns the canonical web_app log group used by its error metric filter.
-  log_groups           = { for key, value in var.log_groups : key => value if key != "web_app" }
-  metric_filters       = { for key, value in var.metric_filters : key => value if value.log_group_key != "web_app" }
+  # This module is the sole Terraform owner for log groups, filters, and app alarms.
+  log_groups           = local.effective_log_groups
+  metric_filters       = var.metric_filters
   app_alarms           = var.app_alarms
   alarm_sns_topic_arns = [module.monitoring.cloudwatch_alarms_topic_arn]
   tags                 = local.common_tags
@@ -160,18 +173,18 @@ module "logging" {
 # ==============================================================================
 # 7. MONITORING & AUTOMATED REMEDIATION
 # ==============================================================================
-module "monitoring" {
-  source                  = "./modules/monitoring"
-  env_prefix              = var.env_prefix
-  asg_name                = module.webserver.asg_name
-  target_group_arn        = module.alb.target_group_arn
-  slack_webhook_url       = var.slack_webhook_url
-  alert_email             = var.alert_email
-  app_log_group_name      = "/aws/${var.env_prefix}/web_app"
-  target_group_dimension  = element(split(":", module.alb.target_group_arn), 5)
-  load_balancer_dimension = trimprefix(element(split(":", module.alb.alb_arn), 5), "loadbalancer/")
 
-  tags = local.common_tags
+module "monitoring" {
+  source                          = "./modules/monitoring"
+  env_prefix                      = var.env_prefix
+  asg_name                        = module.webserver.asg_name
+  target_group_arn                = module.alb.target_group_arn
+  target_group_dimension          = element(split(":", module.alb.target_group_arn), 5)
+  load_balancer_dimension         = trimprefix(element(split(":", module.alb.alb_arn), 5), "loadbalancer/")
+  cloudwatch_agent_parameter_name = var.cloudwatch_agent_parameter_name
+  slack_webhook_url               = var.slack_webhook_url
+  alert_email                     = var.alert_email
+  tags                            = local.common_tags
 }
 
 # ==============================================================================

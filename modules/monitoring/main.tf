@@ -52,7 +52,7 @@ resource "aws_sns_topic_subscription" "email_subscription" {
 # ==============================================================================
 
 resource "aws_ssm_parameter" "cw_agent_config" {
-  name        = "/asg-webserver/cloudwatch-agent-config"
+  name        = var.cloudwatch_agent_parameter_name
   description = "CloudWatch Agent configuration JSON for EC2 instances in Auto Scaling Group"
   type        = "String"
 
@@ -67,9 +67,12 @@ resource "aws_ssm_parameter" "cw_agent_config" {
         InstanceId           = "$${aws:InstanceId}"
         AutoScalingGroupName = "$${aws:AutoScalingGroupName}"
       }
+      # Publish per-instance series plus group-level rollups used by the alarms.
       aggregation_dimensions = [
         ["InstanceId"],
-        ["AutoScalingGroupName", "path", "fstype"]
+        ["AutoScalingGroupName"],
+        ["AutoScalingGroupName", "path", "fstype"],
+        ["InstanceId", "path", "fstype"]
       ]
       metrics_collected = {
         cpu = {
@@ -105,33 +108,28 @@ resource "aws_ssm_parameter" "cw_agent_config" {
           collect_list = [
             {
               file_path         = "/var/log/cloud-init-output.log"
-              log_group_name    = "/ec2/cloud-init-output"
+              log_group_name    = "/aws/${var.env_prefix}/cloud-init-output"
               log_stream_name   = "{instance_id}"
-              retention_in_days = var.log_retention_in_days
             },
             {
               file_path         = "/var/log/user-data.log"
-              log_group_name    = "/ec2/user-data"
+              log_group_name    = "/aws/${var.env_prefix}/user-data"
               log_stream_name   = "{instance_id}"
-              retention_in_days = var.log_retention_in_days
             },
             {
               file_path         = "/var/log/nginx/access.log"
-              log_group_name    = "/ec2/nginx/access"
+              log_group_name    = "/aws/${var.env_prefix}/nginx/access"
               log_stream_name   = "{instance_id}"
-              retention_in_days = var.log_retention_in_days
             },
             {
               file_path         = "/var/log/nginx/error.log"
-              log_group_name    = "/ec2/nginx/error"
+              log_group_name    = "/aws/${var.env_prefix}/nginx/error"
               log_stream_name   = "{instance_id}"
-              retention_in_days = var.log_retention_in_days
             },
             {
               file_path         = "/var/log/app/*.log"
               log_group_name    = "/aws/${var.env_prefix}/web_app"
               log_stream_name   = "{instance_id}"
-              retention_in_days = var.log_retention_in_days
             }
           ]
         }
@@ -157,10 +155,11 @@ resource "aws_cloudwatch_metric_alarm" "high_memory_alarm" {
   threshold           = var.memory_alarm_threshold
   alarm_description   = "Memory usage across the Auto Scaling Group exceeds the configured threshold."
   treat_missing_data  = "missing"
-  dimensions          = { AutoScalingGroupName = var.asg_name }
-  alarm_actions       = [aws_sns_topic.cloudwatch_alarms_topic.arn]
-  ok_actions          = [aws_sns_topic.cloudwatch_alarms_topic.arn]
-  tags                = merge(var.tags, { Name = "${var.env_prefix}-ASG-High-Memory-Alarm" })
+  # The agent's aggregation_dimensions explicitly emits this ASG-only series.
+  dimensions = { AutoScalingGroupName = var.asg_name }
+  alarm_actions = [aws_sns_topic.cloudwatch_alarms_topic.arn]
+  ok_actions    = [aws_sns_topic.cloudwatch_alarms_topic.arn]
+  tags = merge(var.tags, { Name = "${var.env_prefix}-ASG-High-Memory-Alarm" })
 }
 
 resource "aws_cloudwatch_metric_alarm" "unhealthy_alb_alarm" {
@@ -181,7 +180,7 @@ resource "aws_cloudwatch_metric_alarm" "unhealthy_alb_alarm" {
   }
   alarm_actions = [aws_sns_topic.cloudwatch_alarms_topic.arn]
   ok_actions    = [aws_sns_topic.cloudwatch_alarms_topic.arn]
-  tags          = merge(var.tags, { Name = "${var.env_prefix}-ALB-Unhealthy-Targets" })
+  tags = merge(var.tags, { Name = "${var.env_prefix}-ALB-Unhealthy-Targets" })
 }
 
 # --- HIGH DISK UTILIZATION ALARM ---
@@ -216,54 +215,4 @@ resource "aws_cloudwatch_metric_alarm" "high_disk_alarm" {
   )
 }
 
-# ==============================================================================
-# 4. LOG ERROR MONITORING (FILTER + ALARM)
-# ==============================================================================
-
-resource "aws_cloudwatch_log_group" "application_logs" {
-  name              = var.app_log_group_name
-  retention_in_days = var.log_retention_in_days
-  tags              = merge(var.tags, { Name = "${var.env_prefix}-application-logs" })
-}
-
-resource "aws_cloudwatch_log_metric_filter" "app_error_filter" {
-  count          = var.enable_log_error_alarm ? 1 : 0
-  name           = "${var.env_prefix}-app-error-filter"
-  pattern        = var.log_error_pattern
-  log_group_name = var.app_log_group_name
-  depends_on     = [aws_cloudwatch_log_group.application_logs]
-
-  metric_transformation {
-    name          = "${var.env_prefix}-AppErrorCount"
-    namespace     = "CustomAppMetrics"
-    value         = "1"
-    default_value = "0"
-  }
-}
-
-resource "aws_cloudwatch_metric_alarm" "app_error_alarm" {
-  count               = var.enable_log_error_alarm ? 1 : 0
-  alarm_name          = "${var.env_prefix}-App-Log-Errors-Spike"
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  evaluation_periods  = 1
-  metric_name         = aws_cloudwatch_log_metric_filter.app_error_filter[0].metric_transformation[0].name
-  namespace           = aws_cloudwatch_log_metric_filter.app_error_filter[0].metric_transformation[0].namespace
-  period              = var.log_error_alarm_period
-  statistic           = "Sum"
-  threshold           = var.log_error_threshold
-  alarm_description   = "Alarm when application error occurrences in log group '${var.app_log_group_name}' exceed ${var.log_error_threshold}"
-  actions_enabled     = true
-  treat_missing_data  = "notBreaching"
-
-  alarm_actions = [aws_sns_topic.cloudwatch_alarms_topic.arn]
-  ok_actions    = [aws_sns_topic.cloudwatch_alarms_topic.arn]
-
-  tags = merge(
-    var.tags,
-    {
-      Name = "${var.env_prefix}-App-Log-Errors-Alarm"
-    }
-  )
-}
-
-# ==============================================================================
+# Application log groups, metric filters, and application alarms are owned by modules/logging.

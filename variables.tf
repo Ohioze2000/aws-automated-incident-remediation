@@ -1,8 +1,7 @@
 variable "aws_region" {
   type        = string
   description = "AWS region for infrastructure deployment"
-  default     = "us-east-1"
-}
+  }
 
 variable "env_prefix" {
   type        = string
@@ -17,7 +16,6 @@ variable "vpc_cidr_block" {
 variable "az_count" {
   type        = number
   description = "Number of Availability Zones to deploy subnets into"
-  default     = 2
 }
 
 variable "my_ip" {
@@ -25,15 +23,15 @@ variable "my_ip" {
   description = "Administrator IP address for restricted access (CIDR format)"
 }
 
+variable "create_www_record" {
+  type        = bool
+  description = "Whether to create a www DNS alias for the application."
+  default     = true
+}
+
 variable "domain_name" {
   type        = string
   description = "The registered domain name for DNS routing and ACM SSL certification"
-}
-
-variable "create_www_record" {
-  type        = bool
-  description = "Whether to create a www alias record for the application."
-  default     = true
 }
 
 variable "image_name" {
@@ -48,12 +46,20 @@ variable "instance_type" {
 
 variable "app_archive_url" {
   type        = string
-  description = "HTTPS URL of the application source archive consumed by EC2 bootstrap"
+  description = "HTTPS URL of the application archive downloaded by EC2 bootstrap."
+  validation {
+    condition     = startswith(var.app_archive_url, "https://")
+    error_message = "app_archive_url must use HTTPS."
+  }
 }
 
 variable "cloudwatch_agent_parameter_name" {
   type        = string
-  description = "SSM Parameter Store name containing the CloudWatch Agent configuration"
+  description = "SSM parameter name containing the CloudWatch Agent configuration."
+  validation {
+    condition     = startswith(var.cloudwatch_agent_parameter_name, "/")
+    error_message = "cloudwatch_agent_parameter_name must begin with '/'."
+  }
 }
 
 variable "public_key_content" {
@@ -64,36 +70,27 @@ variable "public_key_content" {
 variable "desired_capacity" {
   type        = number
   description = "Target number of instances in the Auto Scaling Group"
-  default     = 2
 }
 
 variable "min_size" {
   type        = number
   description = "Minimum number of instances in the Auto Scaling Group"
-  default     = 2
 }
 
 variable "max_size" {
   type        = number
   description = "Maximum number of instances in the Auto Scaling Group"
-  default     = 4
 }
 
-# variable "slack_webhook_secret_arn" {
-#   type        = string
-#   description = "ARN of a Secrets Manager secret containing the Slack incoming webhook URL"
-#   sensitive   = true
-#   validation {
-#     condition     = can(regex("^arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:.+", var.slack_webhook_secret_arn))
-#     error_message = "slack_webhook_secret_arn must be a Secrets Manager secret ARN."
-#   }
-# }
 variable "slack_webhook_url" {
   type        = string
-  description = "Slack Webhook URL for CloudWatch incident alerting and remediation events"
+  description = "Slack incoming webhook URL. Set as a sensitive HCP Terraform workspace variable; never commit a real value."
   sensitive   = true
+  validation {
+    condition     = startswith(var.slack_webhook_url, "https://hooks.slack.com/")
+    error_message = "slack_webhook_url must be a Slack incoming webhook URL beginning with https://hooks.slack.com/."
+  }
 }
-
 variable "alert_email" {
   type        = string
   description = "Email address for SNS CloudWatch alarm notifications"
@@ -108,7 +105,6 @@ variable "alert_email" {
 variable "default_log_retention_days" {
   type        = number
   description = "Default CloudWatch Log Group retention in days"
-  default     = 30
 }
 
 variable "log_groups" {

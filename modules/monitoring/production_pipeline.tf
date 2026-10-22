@@ -25,7 +25,7 @@ resource "aws_dynamodb_table" "incidents" {
 resource "aws_iam_role" "dispatcher_role" {
   name = "${var.env_prefix}-incident-dispatcher-role"
   assume_role_policy = jsonencode({
-    Version   = "2012-10-17"
+    Version = "2012-10-17"
     Statement = [{ Effect = "Allow", Principal = { Service = "lambda.amazonaws.com" }, Action = "sts:AssumeRole" }]
   })
   tags = var.tags
@@ -49,7 +49,7 @@ resource "aws_iam_role_policy" "dispatcher_policy" {
 resource "aws_iam_role" "worker_role" {
   name = "${var.env_prefix}-remediation-worker-role"
   assume_role_policy = jsonencode({
-    Version   = "2012-10-17"
+    Version = "2012-10-17"
     Statement = [{ Effect = "Allow", Principal = { Service = "lambda.amazonaws.com" }, Action = "sts:AssumeRole" }]
   })
   tags = var.tags
@@ -102,13 +102,13 @@ resource "aws_lambda_function" "remediation_worker" {
   source_code_hash = data.archive_file.worker_zip.output_base64sha256
   environment {
     variables = {
-      INCIDENT_TABLE_NAME          = aws_dynamodb_table.incidents.name
-      SLACK_WEBHOOK_URL            = var.slack_webhook_url
-      TARGET_GROUP_ARN             = var.target_group_arn
-      ASG_NAME                     = var.asg_name
-      MAX_REMEDIATION_ATTEMPTS     = tostring(var.max_remediation_attempts)
-      VERIFICATION_TIMEOUT_SECONDS = tostring(var.verification_timeout_seconds)
-      MIN_HEALTHY_TARGETS          = tostring(var.min_healthy_targets)
+      INCIDENT_TABLE_NAME            = aws_dynamodb_table.incidents.name
+      SLACK_WEBHOOK_URL               = var.slack_webhook_url
+      TARGET_GROUP_ARN               = var.target_group_arn
+      ASG_NAME                       = var.asg_name
+      MAX_REMEDIATION_ATTEMPTS       = tostring(var.max_remediation_attempts)
+      VERIFICATION_TIMEOUT_SECONDS   = tostring(var.verification_timeout_seconds)
+      MIN_HEALTHY_TARGETS            = tostring(var.min_healthy_targets)
     }
   }
   depends_on = [aws_cloudwatch_log_group.worker_logs]
@@ -116,7 +116,7 @@ resource "aws_lambda_function" "remediation_worker" {
 }
 resource "aws_lambda_function_event_invoke_config" "worker_async_failures" {
   function_name                = aws_lambda_function.remediation_worker.function_name
-  maximum_retry_attempts       = 0
+  maximum_retry_attempts      = 0
   maximum_event_age_in_seconds = 3600
   destination_config {
     on_failure {
@@ -138,8 +138,9 @@ resource "aws_lambda_function" "incident_dispatcher" {
     variables = {
       INCIDENT_TABLE_NAME = aws_dynamodb_table.incidents.name
       WORKER_FUNCTION_ARN = aws_lambda_function.remediation_worker.arn
-      ENV_PREFIX          = var.env_prefix
-      INCIDENT_TTL_DAYS   = tostring(var.incident_ttl_days)
+      ENV_PREFIX                 = var.env_prefix
+      INCIDENT_TTL_DAYS          = tostring(var.incident_ttl_days)
+      SLACK_WEBHOOK_URL          = var.slack_webhook_url
     }
   }
   depends_on = [aws_cloudwatch_log_group.dispatcher_logs]
@@ -163,7 +164,7 @@ resource "aws_sns_topic_subscription" "dispatcher_subscription" {
 resource "aws_iam_role" "alarm_manager_role" {
   name = "${var.env_prefix}-cpu-alarm-manager-role"
   assume_role_policy = jsonencode({
-    Version   = "2012-10-17"
+    Version = "2012-10-17"
     Statement = [{ Effect = "Allow", Principal = { Service = "lambda.amazonaws.com" }, Action = "sts:AssumeRole" }]
   })
   tags = var.tags
@@ -199,13 +200,13 @@ resource "aws_lambda_function" "cpu_alarm_manager" {
   source_code_hash = data.archive_file.alarm_manager_zip.output_base64sha256
   environment {
     variables = {
-      ALARM_PREFIX            = var.env_prefix
-      ASG_NAME                = var.asg_name
-      SNS_TOPIC_ARN           = aws_sns_topic.cloudwatch_alarms_topic.arn
-      CPU_ALARM_THRESHOLD     = tostring(var.cpu_alarm_threshold)
-      CPU_ALARM_PERIOD        = tostring(var.cpu_alarm_period)
-      CPU_EVALUATION_PERIODS  = tostring(var.cpu_evaluation_periods)
-      CPU_DATAPOINTS_TO_ALARM = tostring(var.cpu_datapoints_to_alarm)
+      ALARM_PREFIX             = var.env_prefix
+      ASG_NAME                 = var.asg_name
+      SNS_TOPIC_ARN            = aws_sns_topic.cloudwatch_alarms_topic.arn
+      CPU_ALARM_THRESHOLD      = tostring(var.cpu_alarm_threshold)
+      CPU_ALARM_PERIOD         = tostring(var.cpu_alarm_period)
+      CPU_EVALUATION_PERIODS   = tostring(var.cpu_evaluation_periods)
+      CPU_DATAPOINTS_TO_ALARM  = tostring(var.cpu_datapoints_to_alarm)
     }
   }
   depends_on = [aws_cloudwatch_log_group.alarm_manager_logs]
@@ -214,18 +215,18 @@ resource "aws_lambda_function" "cpu_alarm_manager" {
 resource "aws_cloudwatch_event_rule" "asg_launch_success" {
   name = "${var.env_prefix}-asg-instance-launch-success"
   event_pattern = jsonencode({
-    source        = ["aws.autoscaling"]
+    source = ["aws.autoscaling"]
     "detail-type" = ["EC2 Instance Launch Successful"]
-    detail        = { AutoScalingGroupName = [var.asg_name] }
+    detail = { AutoScalingGroupName = [var.asg_name] }
   })
   tags = var.tags
 }
 resource "aws_cloudwatch_event_rule" "asg_terminate_success" {
   name = "${var.env_prefix}-asg-instance-terminate-success"
   event_pattern = jsonencode({
-    source        = ["aws.autoscaling"]
+    source = ["aws.autoscaling"]
     "detail-type" = ["EC2 Instance Terminate Successful"]
-    detail        = { AutoScalingGroupName = [var.asg_name] }
+    detail = { AutoScalingGroupName = [var.asg_name] }
   })
   tags = var.tags
 }

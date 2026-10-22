@@ -26,19 +26,22 @@ resource "aws_iam_role" "ec2_ssm_role" {
   )
 }
 
-# Attach AWS-managed policies for Systems Manager (SSM), CloudWatch Agent, and CloudWatch Read-Only
+# Attach AWS-managed policies required for Systems Manager and CloudWatch Agent
 resource "aws_iam_role_policy_attachment" "managed_policy_attachments" {
   for_each = toset([
     "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
-    "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy",
-    "arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess"
+    "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
   ])
 
   role       = aws_iam_role.ec2_ssm_role.name
   policy_arn = each.value
 }
 
-# Inline policy allowing the EC2 instance to fetch the CloudWatch Agent configuration
+data "aws_partition" "current" {}
+data "aws_region" "current" {}
+data "aws_caller_identity" "current" {}
+
+# Allow the instance to fetch only the configured CloudWatch Agent parameter.
 resource "aws_iam_role_policy" "ec2_read_cw_ssm_parameter" {
   name = "${var.env_prefix}-ec2-read-cw-ssm-param"
   role = aws_iam_role.ec2_ssm_role.id
@@ -53,7 +56,7 @@ resource "aws_iam_role_policy" "ec2_read_cw_ssm_parameter" {
           "ssm:GetParameter",
           "ssm:GetParameters"
         ]
-        Resource = "arn:aws:ssm:*:*:parameter/asg-webserver/cloudwatch-agent-config"
+        Resource = "arn:${data.aws_partition.current.partition}:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:parameter${var.cloudwatch_agent_parameter_name}"
       }
     ]
   })

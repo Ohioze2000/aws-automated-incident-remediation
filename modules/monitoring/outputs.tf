@@ -26,7 +26,3 @@ output "high_disk_alarm_arn" {
   description = "ARN of the high disk utilization alarm, if enabled"
   value       = length(aws_cloudwatch_metric_alarm.high_disk_alarm) > 0 ? aws_cloudwatch_metric_alarm.high_disk_alarm[0].arn : null
 }
-output "log_error_alarm_arn" {
-  description = "ARN of the application log error alarm, if enabled"
-  value       = length(aws_cloudwatch_metric_alarm.app_error_alarm) > 0 ? aws_cloudwatch_metric_alarm.app_error_alarm[0].arn : null
-}

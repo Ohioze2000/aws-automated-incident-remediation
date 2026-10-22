@@ -27,16 +27,6 @@ output "website_url" {
   value       = "https://${var.domain_name}"
 }
 
-output "domain_name" {
-  description = "Application domain name used for DNS and certificate validation"
-  value       = var.domain_name
-}
-
-output "www_website_url" {
-  description = "HTTPS URL for the www application alias, when enabled"
-  value       = var.create_www_record ? "https://www.${var.domain_name}" : null
-}
-
 # ==============================================================================
 # COMPUTE OUTPUTS
 # ==============================================================================
@@ -116,4 +106,33 @@ output "log_group_arns" {
 output "app_alarm_arns" {
   description = "Map of created application metric alarm ARNs"
   value       = module.logging.alarm_arns
+}
+output "incident_table_name" {
+  description = "DynamoDB table storing incident lifecycle and verification records"
+  value       = module.monitoring.incident_table_name
+}
+
+output "dispatcher_lambda_arn" {
+  description = "ARN of the SNS incident dispatcher Lambda"
+  value       = module.monitoring.dispatcher_lambda_arn
+}
+
+output "remediation_worker_lambda_arn" {
+  description = "ARN of the bounded remediation worker Lambda"
+  value       = module.monitoring.remediation_worker_lambda_arn
+}
+
+output "memory_alarm_arn" {
+  description = "ARN of the ASG-level memory alarm"
+  value       = module.monitoring.memory_alarm_arn
+}
+
+output "unhealthy_alb_alarm_arn" {
+  description = "ARN of the unhealthy ALB target alarm"
+  value       = module.monitoring.unhealthy_alb_alarm_arn
+}
+
+output "high_disk_alarm_arn" {
+  description = "ARN of the high disk utilization alarm, or null if disabled"
+  value       = module.monitoring.high_disk_alarm_arn
 }

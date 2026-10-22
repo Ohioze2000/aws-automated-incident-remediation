@@ -81,13 +81,20 @@ variable "tags" {
   description = "A map of tags to assign to all module resources"
   default     = {}
 }
-
 variable "app_archive_url" {
   type        = string
-  description = "HTTPS URL of the application source archive consumed by EC2 bootstrap"
+  description = "HTTPS URL of the application archive downloaded by the instance bootstrap script."
+  validation {
+    condition     = startswith(var.app_archive_url, "https://")
+    error_message = "app_archive_url must use HTTPS."
+  }
 }
 
 variable "cloudwatch_agent_parameter_name" {
   type        = string
-  description = "SSM Parameter Store name containing the CloudWatch Agent configuration"
+  description = "SSM parameter name used to load the CloudWatch Agent configuration."
+  validation {
+    condition     = startswith(var.cloudwatch_agent_parameter_name, "/")
+    error_message = "cloudwatch_agent_parameter_name must begin with '/'."
+  }
 }
