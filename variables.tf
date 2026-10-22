@@ -1,7 +1,7 @@
 variable "aws_region" {
   type        = string
   description = "AWS region for infrastructure deployment"
-  }
+}
 
 variable "env_prefix" {
   type        = string

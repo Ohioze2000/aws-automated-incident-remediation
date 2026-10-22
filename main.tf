@@ -78,13 +78,13 @@ module "ssl" {
 }
 
 module "dns" {
-  source       = "./modules/dns"
+  source            = "./modules/dns"
   domain_name       = var.domain_name
   env_prefix        = var.env_prefix
   create_www_record = var.create_www_record
   alb_dns_name      = module.alb.alb_dns_name
-  alb_zone_id  = module.alb.alb_zone_id
-  tags         = local.common_tags
+  alb_zone_id       = module.alb.alb_zone_id
+  tags              = local.common_tags
 }
 
 resource "aws_route53_record" "cert_validation" {
