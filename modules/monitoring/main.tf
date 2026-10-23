@@ -107,29 +107,29 @@ resource "aws_ssm_parameter" "cw_agent_config" {
         files = {
           collect_list = [
             {
-              file_path         = "/var/log/cloud-init-output.log"
-              log_group_name    = "/aws/${var.env_prefix}/cloud-init-output"
-              log_stream_name   = "{instance_id}"
+              file_path       = "/var/log/cloud-init-output.log"
+              log_group_name  = "/aws/${var.env_prefix}/cloud-init-output"
+              log_stream_name = "{instance_id}"
             },
             {
-              file_path         = "/var/log/user-data.log"
-              log_group_name    = "/aws/${var.env_prefix}/user-data"
-              log_stream_name   = "{instance_id}"
+              file_path       = "/var/log/user-data.log"
+              log_group_name  = "/aws/${var.env_prefix}/user-data"
+              log_stream_name = "{instance_id}"
             },
             {
-              file_path         = "/var/log/nginx/access.log"
-              log_group_name    = "/aws/${var.env_prefix}/nginx/access"
-              log_stream_name   = "{instance_id}"
+              file_path       = "/var/log/nginx/access.log"
+              log_group_name  = "/aws/${var.env_prefix}/nginx/access"
+              log_stream_name = "{instance_id}"
             },
             {
-              file_path         = "/var/log/nginx/error.log"
-              log_group_name    = "/aws/${var.env_prefix}/nginx/error"
-              log_stream_name   = "{instance_id}"
+              file_path       = "/var/log/nginx/error.log"
+              log_group_name  = "/aws/${var.env_prefix}/nginx/error"
+              log_stream_name = "{instance_id}"
             },
             {
-              file_path         = "/var/log/app/*.log"
-              log_group_name    = "/aws/${var.env_prefix}/web_app"
-              log_stream_name   = "{instance_id}"
+              file_path       = "/var/log/app/*.log"
+              log_group_name  = "/aws/${var.env_prefix}/web_app"
+              log_stream_name = "{instance_id}"
             }
           ]
         }
@@ -156,10 +156,10 @@ resource "aws_cloudwatch_metric_alarm" "high_memory_alarm" {
   alarm_description   = "Memory usage across the Auto Scaling Group exceeds the configured threshold."
   treat_missing_data  = "missing"
   # The agent's aggregation_dimensions explicitly emits this ASG-only series.
-  dimensions = { AutoScalingGroupName = var.asg_name }
+  dimensions    = { AutoScalingGroupName = var.asg_name }
   alarm_actions = [aws_sns_topic.cloudwatch_alarms_topic.arn]
   ok_actions    = [aws_sns_topic.cloudwatch_alarms_topic.arn]
-  tags = merge(var.tags, { Name = "${var.env_prefix}-ASG-High-Memory-Alarm" })
+  tags          = merge(var.tags, { Name = "${var.env_prefix}-ASG-High-Memory-Alarm" })
 }
 
 resource "aws_cloudwatch_metric_alarm" "unhealthy_alb_alarm" {
@@ -180,7 +180,7 @@ resource "aws_cloudwatch_metric_alarm" "unhealthy_alb_alarm" {
   }
   alarm_actions = [aws_sns_topic.cloudwatch_alarms_topic.arn]
   ok_actions    = [aws_sns_topic.cloudwatch_alarms_topic.arn]
-  tags = merge(var.tags, { Name = "${var.env_prefix}-ALB-Unhealthy-Targets" })
+  tags          = merge(var.tags, { Name = "${var.env_prefix}-ALB-Unhealthy-Targets" })
 }
 
 # --- HIGH DISK UTILIZATION ALARM ---

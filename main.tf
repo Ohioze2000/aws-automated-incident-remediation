@@ -80,14 +80,14 @@ module "ssl" {
 }
 
 module "dns" {
-  source       = "./modules/dns"
+  source            = "./modules/dns"
   domain_name       = var.domain_name
   env_prefix        = var.env_prefix
   create_www_record = var.create_www_record
   # IPv6 DNS aliases remain disabled until the VPC/subnets and ALB are configured dual-stack.
-  enable_ipv6       = false
-  alb_dns_name      = module.alb.alb_dns_name
-  alb_zone_id       = module.alb.alb_zone_id
+  enable_ipv6  = false
+  alb_dns_name = module.alb.alb_dns_name
+  alb_zone_id  = module.alb.alb_zone_id
   tags         = local.common_tags
 }
 

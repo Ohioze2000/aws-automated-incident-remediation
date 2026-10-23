@@ -133,7 +133,7 @@ variable "metric_filters" {
     metric_namespace = string
     metric_value     = optional(string, "1")
     # CloudWatch metric-filter default_value is numeric. Leave null when not needed.
-    default_value    = optional(number)
+    default_value = optional(number)
   }))
   description = "Log metric filters for application errors, HTTP 5xx responses, and database connectivity failures."
   default = {
