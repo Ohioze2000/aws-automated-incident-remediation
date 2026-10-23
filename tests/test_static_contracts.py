@@ -53,6 +53,19 @@ class IncidentPipelineContractTests(unittest.TestCase):
         self.assertIn('"db"', source)
         self.assertIn('return "application_error"', source)
 
+    def test_harmonized_application_metric_filters_and_alarms(self):
+        root_variables = (ROOT / "variables.tf").read_text(encoding="utf-8")
+        logging_variables = (ROOT / "modules/logging/variables.tf").read_text(encoding="utf-8")
+        example = (ROOT / "terraform.tfvars.example").read_text(encoding="utf-8")
+        for signal in ("ApplicationErrors", "HTTP5xxCount", "DBConnectionTimeoutCount"):
+            self.assertIn(signal, root_variables)
+            self.assertIn(signal, example)
+        self.assertIn('log_group_key    = "web_app"', root_variables)
+        self.assertIn('log_group_key    = "nginx/access"', root_variables)
+        self.assertIn('default_value    = optional(number)', root_variables)
+        self.assertIn('default_value    = optional(number)', logging_variables)
+        self.assertIn('metric_namespace = "CustomAppMetrics"', example)
+
     def test_logging_module_is_single_owner(self):
         root_main = (ROOT / "main.tf").read_text(encoding="utf-8")
         monitoring = (ROOT / "modules/monitoring/main.tf").read_text(encoding="utf-8")
@@ -69,6 +82,70 @@ class IncidentPipelineContractTests(unittest.TestCase):
         source = source.replace("$${", "${")
         result = subprocess.run(["bash", "-n"], input=source, text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_alarm_manager_has_reconciliation_permissions(self):
+        source = (ROOT / "modules/monitoring/production_pipeline.tf").read_text(encoding="utf-8")
+        policy_start = source.index('resource "aws_iam_role_policy" "alarm_manager_policy"')
+        policy_end = source.index('resource "aws_cloudwatch_log_group" "alarm_manager_logs"', policy_start)
+        policy = source[policy_start:policy_end]
+        self.assertIn("cloudwatch:DescribeAlarms", policy)
+        self.assertIn("cloudwatch:PutMetricAlarm", policy)
+        self.assertIn("cloudwatch:DeleteAlarms", policy)
+
+    def test_dispatch_failed_incidents_can_be_retried_idempotently(self):
+        dispatcher = (ROOT / "modules/monitoring/dispatcher.py").read_text(encoding="utf-8")
+        pipeline = (ROOT / "modules/monitoring/production_pipeline.tf").read_text(encoding="utf-8")
+        self.assertIn('existing.get("status") != "DISPATCH_FAILED"', dispatcher)
+        self.assertIn('ConditionExpression="#s = :failed"', dispatcher)
+        self.assertIn('"dynamodb:GetItem"', pipeline)
+
+    def test_lambda_verification_window_fits_worker_timeout(self):
+        pipeline = (ROOT / "modules/monitoring/production_pipeline.tf").read_text(encoding="utf-8")
+        variables = (ROOT / "modules/monitoring/variables.tf").read_text(encoding="utf-8")
+        self.assertIn("timeout          = 600", pipeline)
+        self.assertIn("default     = 420", variables)
+        self.assertIn("<= 540", variables)
+
+    def test_audit_report_states_unvalidated_deployment_limitations(self):
+        report = (ROOT / "AUDIT_REPORT.md").read_text(encoding="utf-8")
+        self.assertIn("NOT CLEARED FOR DEPLOYMENT YET", report)
+        self.assertIn("terraform validate", report)
+        self.assertIn("observe-only", report)
+
+    def test_custom_metric_flag_is_not_advertised_when_unused(self):
+        root_variables = (ROOT / "variables.tf").read_text(encoding="utf-8")
+        logging_variables = (ROOT / "modules/logging/variables.tf").read_text(encoding="utf-8")
+        example = (ROOT / "terraform.tfvars.example").read_text(encoding="utf-8")
+        self.assertNotIn("is_custom_metric", root_variables + logging_variables + example)
+
+    def test_destroy_workflow_does_not_announce_success_before_destroy(self):
+        workflow = (ROOT / ".github/workflows/destroy.yml").read_text(encoding="utf-8")
+        self.assertIn("terraform destroy -auto-approve -input=false", workflow)
+        self.assertNotIn("-out=destroy.tfplan", workflow)
+        self.assertNotIn("Started Infrastructure Teardown Successfully", workflow)
+        self.assertIn("needs: plan-destroy", workflow)
+        self.assertIn("environment: production", workflow)
+
+    def test_ssl_module_receives_environment_prefix(self):
+        root_main = (ROOT / "main.tf").read_text(encoding="utf-8")
+        ssl_variables = (ROOT / "modules/ssl/variables.tf").read_text(encoding="utf-8")
+        self.assertIn('env_prefix                = var.env_prefix', root_main)
+        self.assertIn('variable "env_prefix"', ssl_variables)
+
+    def test_www_certificate_and_ipv6_dns_are_consistent(self):
+        root_main = (ROOT / "main.tf").read_text(encoding="utf-8")
+        self.assertIn('subject_alternative_names = var.create_www_record ? ["www.${var.domain_name}"] : []', root_main)
+        self.assertIn("enable_ipv6       = false", root_main)
+
+    def test_runtime_target_health_wait_allows_instance_bootstrap(self):
+        source = (ROOT / "validate_infra.py").read_text(encoding="utf-8")
+        self.assertIn("def validate_alb_targets(max_retries: int = 40, delay: int = 15)", source)
+
+    def test_terraform_lockfile_is_not_ignored_and_fmt_is_recursive(self):
+        gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+        workflow = (ROOT / ".github/workflows/aws-asg-incd-cicd.yml").read_text(encoding="utf-8")
+        self.assertNotIn(".terraform.lock.hcl", gitignore)
+        self.assertIn("terraform fmt -check -recursive", workflow)
 
     def test_parameter_name_shared_across_bootstrap_and_iam(self):
         root_main = (ROOT / "main.tf").read_text(encoding="utf-8")

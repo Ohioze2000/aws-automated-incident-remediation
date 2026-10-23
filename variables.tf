@@ -1,6 +1,7 @@
 variable "aws_region" {
   type        = string
   description = "AWS region for infrastructure deployment"
+  default     = "us-east-1"
 }
 
 variable "env_prefix" {
@@ -16,6 +17,7 @@ variable "vpc_cidr_block" {
 variable "az_count" {
   type        = number
   description = "Number of Availability Zones to deploy subnets into"
+  default     = 2
 }
 
 variable "my_ip" {
@@ -56,6 +58,7 @@ variable "app_archive_url" {
 variable "cloudwatch_agent_parameter_name" {
   type        = string
   description = "SSM parameter name containing the CloudWatch Agent configuration."
+  default     = "/asg-webserver/cloudwatch-agent-config"
   validation {
     condition     = startswith(var.cloudwatch_agent_parameter_name, "/")
     error_message = "cloudwatch_agent_parameter_name must begin with '/'."
@@ -70,16 +73,19 @@ variable "public_key_content" {
 variable "desired_capacity" {
   type        = number
   description = "Target number of instances in the Auto Scaling Group"
+  default     = 2
 }
 
 variable "min_size" {
   type        = number
   description = "Minimum number of instances in the Auto Scaling Group"
+  default     = 2
 }
 
 variable "max_size" {
   type        = number
   description = "Maximum number of instances in the Auto Scaling Group"
+  default     = 4
 }
 
 variable "slack_webhook_url" {
@@ -91,6 +97,8 @@ variable "slack_webhook_url" {
     error_message = "slack_webhook_url must be a Slack incoming webhook URL beginning with https://hooks.slack.com/."
   }
 }
+
+
 variable "alert_email" {
   type        = string
   description = "Email address for SNS CloudWatch alarm notifications"
@@ -105,6 +113,7 @@ variable "alert_email" {
 variable "default_log_retention_days" {
   type        = number
   description = "Default CloudWatch Log Group retention in days"
+  default     = 30
 }
 
 variable "log_groups" {
@@ -123,10 +132,36 @@ variable "metric_filters" {
     metric_name      = string
     metric_namespace = string
     metric_value     = optional(string, "1")
-    default_value    = optional(string, "0")
+    # CloudWatch metric-filter default_value is numeric. Leave null when not needed.
+    default_value    = optional(number)
   }))
-  description = "Map of log metric filters to convert logs into custom CloudWatch metrics"
-  default     = {}
+  description = "Log metric filters for application errors, HTTP 5xx responses, and database connectivity failures."
+  default = {
+    application_errors = {
+      log_group_key    = "web_app"
+      pattern          = "\"ERROR\""
+      metric_name      = "ApplicationErrors"
+      metric_namespace = "CustomAppMetrics"
+      metric_value     = "1"
+      default_value    = 0
+    }
+
+    http_5xx_errors = {
+      log_group_key    = "nginx/access"
+      pattern          = "[host, logName, user, timestamp, request, statusCode = 5*, size]"
+      metric_name      = "HTTP5xxCount"
+      metric_namespace = "CustomAppMetrics"
+      metric_value     = "1"
+    }
+
+    database_timeouts = {
+      log_group_key    = "web_app"
+      pattern          = "?ERROR ?Timeout ?\"Connection refused\""
+      metric_name      = "DBConnectionTimeoutCount"
+      metric_namespace = "CustomAppMetrics"
+      metric_value     = "1"
+    }
+  }
 }
 
 variable "app_alarms" {
@@ -134,7 +169,6 @@ variable "app_alarms" {
     metric_name         = string
     metric_namespace    = string
     threshold           = number
-    is_custom_metric    = optional(bool, true)
     comparison_operator = optional(string, "GreaterThanOrEqualToThreshold")
     evaluation_periods  = optional(number, 1)
     period              = optional(number, 60)
@@ -143,8 +177,47 @@ variable "app_alarms" {
     treat_missing_data  = optional(string, "notBreaching")
     dimensions          = optional(map(string), {})
   }))
-  description = "Map of custom CloudWatch application alarms"
-  default     = {}
+  description = "CloudWatch alarms for custom application metrics."
+  default = {
+    application_errors = {
+      metric_name         = "ApplicationErrors"
+      metric_namespace    = "CustomAppMetrics"
+      threshold           = 5
+      comparison_operator = "GreaterThanOrEqualToThreshold"
+      evaluation_periods  = 2
+      period              = 60
+      statistic           = "Sum"
+      description         = "Triggers when application ERROR events reach the configured threshold over two evaluation periods."
+      treat_missing_data  = "notBreaching"
+      dimensions          = {}
+    }
+
+    high_5xx_rate = {
+      metric_name         = "HTTP5xxCount"
+      metric_namespace    = "CustomAppMetrics"
+      threshold           = 10
+      comparison_operator = "GreaterThanOrEqualToThreshold"
+      evaluation_periods  = 1
+      period              = 300
+      statistic           = "Sum"
+      description         = "Triggers when HTTP 5xx responses reach ten within five minutes."
+      treat_missing_data  = "notBreaching"
+      dimensions          = {}
+    }
+
+    db_connectivity_failure = {
+      metric_name         = "DBConnectionTimeoutCount"
+      metric_namespace    = "CustomAppMetrics"
+      threshold           = 1
+      comparison_operator = "GreaterThanOrEqualToThreshold"
+      evaluation_periods  = 1
+      period              = 60
+      statistic           = "Sum"
+      description         = "Triggers when a database timeout or connection-refused event is detected."
+      treat_missing_data  = "notBreaching"
+      dimensions          = {}
+    }
+  }
 }
 
 variable "tags" {

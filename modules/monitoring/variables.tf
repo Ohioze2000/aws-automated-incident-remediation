@@ -46,7 +46,11 @@ variable "max_remediation_attempts" {
 variable "verification_timeout_seconds" {
   type        = number
   description = "Maximum time spent checking the outcome of a recovery action"
-  default     = 180
+  default     = 420
+  validation {
+    condition     = var.verification_timeout_seconds >= 30 && var.verification_timeout_seconds <= 540
+    error_message = "verification_timeout_seconds must be between 30 and 540 seconds; the worker Lambda timeout is 600 seconds."
+  }
 }
 
 variable "incident_ttl_days" {

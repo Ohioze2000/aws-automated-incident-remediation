@@ -31,7 +31,7 @@ variable "metric_filters" {
     metric_name      = string
     metric_namespace = string
     metric_value     = optional(string, "1")
-    default_value    = optional(string, "0")
+    default_value    = optional(number)
   }))
   description = "Map of custom CloudWatch log metric filters to parse error logs or custom events"
   default     = {}
@@ -42,7 +42,6 @@ variable "app_alarms" {
     metric_name         = string
     metric_namespace    = string
     threshold           = number
-    is_custom_metric    = optional(bool, true)
     comparison_operator = optional(string, "GreaterThanOrEqualToThreshold")
     evaluation_periods  = optional(number, 1)
     period              = optional(number, 60)

@@ -85,7 +85,7 @@ def validate_security_groups() -> bool:
         return False
 
 
-def validate_alb_targets(max_retries: int = 20, delay: int = 15) -> bool:
+def validate_alb_targets(max_retries: int = 40, delay: int = 15) -> bool:
     """Polls Target Group until all targets achieve a healthy state."""
     print("🏥 Checking Target Group health status...")
     if not TARGET_GROUP_ARN:

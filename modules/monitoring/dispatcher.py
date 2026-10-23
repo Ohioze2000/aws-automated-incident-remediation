@@ -103,10 +103,55 @@ def lambda_handler(event, context):
         try:
             TABLE.put_item(Item=item, ConditionExpression="attribute_not_exists(incident_id)")
         except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                LOG.info("Duplicate alarm delivery suppressed incident_id=%s", incident_id)
+            if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                raise
+
+            # A prior SNS/Lambda delivery may have persisted the incident but failed
+            # before the worker accepted the async invocation. Retry only that known
+            # failure state; never redispatch completed or actively processing incidents.
+            existing = TABLE.get_item(
+                Key={"incident_id": incident_id}, ConsistentRead=True
+            ).get("Item", {})
+            if existing.get("status") != "DISPATCH_FAILED":
+                LOG.info("Duplicate alarm delivery suppressed incident_id=%s status=%s", incident_id, existing.get("status", "missing"))
                 continue
-            raise
+            try:
+                TABLE.update_item(
+                    Key={"incident_id": incident_id},
+                    UpdateExpression="SET #s = :dispatched, updated_at = :t REMOVE dispatch_error",
+                    ConditionExpression="#s = :failed",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={
+                        ":dispatched": "DISPATCHED",
+                        ":failed": "DISPATCH_FAILED",
+                        ":t": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+            except ClientError as claim_exc:
+                if claim_exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                    LOG.info("Dispatch retry already claimed incident_id=%s", incident_id)
+                    continue
+                raise
+            try:
+                lam.invoke(
+                    FunctionName=WORKER_ARN,
+                    InvocationType="Event",
+                    Payload=json.dumps({"incident_id": incident_id}).encode("utf-8"),
+                )
+                LOG.warning("Retried previously failed worker dispatch incident_id=%s", incident_id)
+            except Exception:
+                TABLE.update_item(
+                    Key={"incident_id": incident_id},
+                    UpdateExpression="SET #s = :s, dispatch_error = :e, updated_at = :t",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={
+                        ":s": "DISPATCH_FAILED",
+                        ":e": "Worker invocation failed during dispatch retry",
+                        ":t": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+                raise
+            continue
         TABLE.update_item(
             Key={"incident_id": incident_id},
             UpdateExpression="SET #s = :s, updated_at = :t",
