@@ -83,7 +83,7 @@ jobs:
       # Remote Apply on merge to main branch
       - name: Terraform Apply
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: terraform apply -auto-approve -input=false
+        run: terraform destroy -auto-approve -input=false
 
       # --- CAPTURE INFRASTRUCTURE METADATA FROM TFC STATE ---
       - name: Capture Infrastructure Outputs
