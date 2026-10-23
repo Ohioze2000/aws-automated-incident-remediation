@@ -135,7 +135,7 @@ variable "metric_filters" {
     default_value = optional(number)
   }))
   description = "Log metric filters for application errors, HTTP 5xx responses, and database connectivity failures."
-  default = {}
+  default     = {}
 }
 
 variable "app_alarms" {
@@ -152,7 +152,7 @@ variable "app_alarms" {
     dimensions          = optional(map(string), {})
   }))
   description = "CloudWatch alarms for custom application metrics."
-  default = {}
+  default     = {}
 }
 
 variable "tags" {
