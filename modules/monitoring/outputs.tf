@@ -26,3 +26,12 @@ output "high_disk_alarm_arn" {
   description = "ARN of the high disk utilization alarm, if enabled"
   value       = length(aws_cloudwatch_metric_alarm.high_disk_alarm) > 0 ? aws_cloudwatch_metric_alarm.high_disk_alarm[0].arn : null
 }
+
+output "incident_event_router_lambda_arn" {
+  description = "EventBridge router for target-health and Auto Scaling lifecycle events"
+  value       = aws_lambda_function.incident_event_router.arn
+}
+output "asg_lifecycle_events_table_name" {
+  description = "DynamoDB table containing Auto Scaling lifecycle evidence"
+  value       = aws_dynamodb_table.asg_lifecycle_events.name
+}

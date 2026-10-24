@@ -113,6 +113,7 @@ variable "alert_email" {
 variable "default_log_retention_days" {
   type        = number
   description = "Default CloudWatch Log Group retention in days"
+  default     = 30
 }
 
 variable "log_groups" {
@@ -135,7 +136,32 @@ variable "metric_filters" {
     default_value = optional(number)
   }))
   description = "Log metric filters for application errors, HTTP 5xx responses, and database connectivity failures."
-  default     = {}
+  default = {
+    application_errors = {
+      log_group_key    = "web_app"
+      pattern          = "\"ERROR\""
+      metric_name      = "ApplicationErrors"
+      metric_namespace = "CustomAppMetrics"
+      metric_value     = "1"
+      default_value    = 0
+    }
+
+    http_5xx_errors = {
+      log_group_key    = "nginx/access"
+      pattern          = "[host, logName, user, timestamp, request, statusCode = 5*, size]"
+      metric_name      = "HTTP5xxCount"
+      metric_namespace = "CustomAppMetrics"
+      metric_value     = "1"
+    }
+
+    database_timeouts = {
+      log_group_key    = "web_app"
+      pattern          = "?ERROR ?Timeout ?\"Connection refused\""
+      metric_name      = "DBConnectionTimeoutCount"
+      metric_namespace = "CustomAppMetrics"
+      metric_value     = "1"
+    }
+  }
 }
 
 variable "app_alarms" {
@@ -152,7 +178,46 @@ variable "app_alarms" {
     dimensions          = optional(map(string), {})
   }))
   description = "CloudWatch alarms for custom application metrics."
-  default     = {}
+  default = {
+    application_errors = {
+      metric_name         = "ApplicationErrors"
+      metric_namespace    = "CustomAppMetrics"
+      threshold           = 5
+      comparison_operator = "GreaterThanOrEqualToThreshold"
+      evaluation_periods  = 2
+      period              = 60
+      statistic           = "Sum"
+      description         = "Triggers when application ERROR events reach the configured threshold over two evaluation periods."
+      treat_missing_data  = "notBreaching"
+      dimensions          = {}
+    }
+
+    high_5xx_rate = {
+      metric_name         = "HTTP5xxCount"
+      metric_namespace    = "CustomAppMetrics"
+      threshold           = 10
+      comparison_operator = "GreaterThanOrEqualToThreshold"
+      evaluation_periods  = 1
+      period              = 300
+      statistic           = "Sum"
+      description         = "Triggers when HTTP 5xx responses reach ten within five minutes."
+      treat_missing_data  = "notBreaching"
+      dimensions          = {}
+    }
+
+    db_connectivity_failure = {
+      metric_name         = "DBConnectionTimeoutCount"
+      metric_namespace    = "CustomAppMetrics"
+      threshold           = 1
+      comparison_operator = "GreaterThanOrEqualToThreshold"
+      evaluation_periods  = 1
+      period              = 60
+      statistic           = "Sum"
+      description         = "Triggers when a database timeout or connection-refused event is detected."
+      treat_missing_data  = "notBreaching"
+      dimensions          = {}
+    }
+  }
 }
 
 variable "tags" {

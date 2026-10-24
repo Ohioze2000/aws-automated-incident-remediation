@@ -22,6 +22,33 @@ resource "aws_dynamodb_table" "incidents" {
   tags = merge(var.tags, { Name = "${var.env_prefix}-incidents" })
 }
 
+resource "aws_dynamodb_table" "asg_lifecycle_events" {
+  name         = "${var.env_prefix}-asg-lifecycle-events"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "asg_name"
+  range_key    = "event_key"
+
+  attribute {
+    name = "asg_name"
+    type = "S"
+  }
+  attribute {
+    name = "event_key"
+    type = "S"
+  }
+  point_in_time_recovery {
+    enabled = true
+  }
+  server_side_encryption {
+    enabled = true
+  }
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+  tags = merge(var.tags, { Name = "${var.env_prefix}-asg-lifecycle-events" })
+}
+
 resource "aws_iam_role" "dispatcher_role" {
   name = "${var.env_prefix}-incident-dispatcher-role"
   assume_role_policy = jsonencode({
@@ -65,6 +92,7 @@ resource "aws_iam_role_policy" "worker_policy" {
     Version = "2012-10-17"
     Statement = [
       { Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:UpdateItem"], Resource = aws_dynamodb_table.incidents.arn },
+      { Effect = "Allow", Action = ["dynamodb:Query"], Resource = aws_dynamodb_table.asg_lifecycle_events.arn },
       { Effect = "Allow", Action = ["elasticloadbalancing:DescribeTargetHealth"], Resource = "*" },
       { Effect = "Allow", Action = ["autoscaling:DescribeAutoScalingGroups", "autoscaling:TerminateInstanceInAutoScalingGroup"], Resource = "*" },
       { Effect = "Allow", Action = ["ec2:DescribeInstances"], Resource = "*" },
@@ -103,6 +131,7 @@ resource "aws_lambda_function" "remediation_worker" {
   environment {
     variables = {
       INCIDENT_TABLE_NAME          = aws_dynamodb_table.incidents.name
+      LIFECYCLE_TABLE_NAME         = aws_dynamodb_table.asg_lifecycle_events.name
       SLACK_WEBHOOK_URL            = var.slack_webhook_url
       TARGET_GROUP_ARN             = var.target_group_arn
       ASG_NAME                     = var.asg_name
@@ -158,6 +187,111 @@ resource "aws_sns_topic_subscription" "dispatcher_subscription" {
   protocol   = "lambda"
   endpoint   = aws_lambda_function.incident_dispatcher.arn
   depends_on = [aws_lambda_permission.allow_sns_dispatcher]
+}
+
+# Target-health events carry the target ID; lifecycle events let the worker distinguish
+# native Auto Scaling replacement from a termination requested by the worker.
+resource "aws_iam_role" "event_router_role" {
+  name = "${var.env_prefix}-incident-event-router-role"
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Effect = "Allow", Principal = { Service = "lambda.amazonaws.com" }, Action = "sts:AssumeRole" }]
+  })
+  tags = var.tags
+}
+resource "aws_iam_role_policy_attachment" "event_router_logs" {
+  role       = aws_iam_role.event_router_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+resource "aws_iam_role_policy" "event_router_policy" {
+  name = "${var.env_prefix}-incident-event-router-policy"
+  role = aws_iam_role.event_router_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      { Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:UpdateItem"], Resource = aws_dynamodb_table.incidents.arn },
+      { Effect = "Allow", Action = ["dynamodb:PutItem"], Resource = aws_dynamodb_table.asg_lifecycle_events.arn },
+      { Effect = "Allow", Action = ["autoscaling:DescribeAutoScalingGroups"], Resource = "*" },
+      { Effect = "Allow", Action = ["lambda:InvokeFunction"], Resource = aws_lambda_function.remediation_worker.arn }
+    ]
+  })
+}
+resource "aws_cloudwatch_log_group" "event_router_logs" {
+  name              = "/aws/lambda/${var.env_prefix}-incident-event-router"
+  retention_in_days = var.log_retention_in_days
+  tags              = var.tags
+}
+resource "aws_lambda_function" "incident_event_router" {
+  filename         = data.archive_file.event_router_zip.output_path
+  function_name    = "${var.env_prefix}-incident-event-router"
+  role             = aws_iam_role.event_router_role.arn
+  handler          = "event_router.lambda_handler"
+  runtime          = "python3.12"
+  timeout          = 30
+  memory_size      = 128
+  source_code_hash = data.archive_file.event_router_zip.output_base64sha256
+  environment {
+    variables = {
+      INCIDENT_TABLE_NAME  = aws_dynamodb_table.incidents.name
+      LIFECYCLE_TABLE_NAME = aws_dynamodb_table.asg_lifecycle_events.name
+      WORKER_FUNCTION_ARN  = aws_lambda_function.remediation_worker.arn
+      ASG_NAME             = var.asg_name
+      ENV_PREFIX           = var.env_prefix
+      INCIDENT_TTL_DAYS    = tostring(var.incident_ttl_days)
+      SLACK_WEBHOOK_URL    = var.slack_webhook_url
+    }
+  }
+  depends_on = [aws_cloudwatch_log_group.event_router_logs]
+  tags       = var.tags
+}
+resource "aws_cloudwatch_event_rule" "elb_target_health_unhealthy" {
+  name        = "${var.env_prefix}-elb-target-health-unhealthy"
+  description = "Capture target-specific ELB unhealthy transitions for incident correlation."
+  event_pattern = jsonencode({
+    source        = ["aws.elasticloadbalancing"]
+    "detail-type" = ["ELB Target Health State Change"]
+    detail = {
+      "target-group-arn" = [var.target_group_arn]
+      "target-health"    = { state = ["unhealthy"] }
+    }
+  })
+  tags = var.tags
+}
+resource "aws_cloudwatch_event_target" "elb_target_health_router" {
+  rule      = aws_cloudwatch_event_rule.elb_target_health_unhealthy.name
+  target_id = "incident-event-router-target-health"
+  arn       = aws_lambda_function.incident_event_router.arn
+}
+resource "aws_lambda_permission" "allow_eventbridge_target_health" {
+  statement_id  = "AllowEventBridgeTargetHealthRouter"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.incident_event_router.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.elb_target_health_unhealthy.arn
+}
+resource "aws_cloudwatch_event_target" "asg_launch_lifecycle_router" {
+  rule      = aws_cloudwatch_event_rule.asg_launch_success.name
+  target_id = "incident-event-router-launch-lifecycle"
+  arn       = aws_lambda_function.incident_event_router.arn
+}
+resource "aws_cloudwatch_event_target" "asg_terminate_lifecycle_router" {
+  rule      = aws_cloudwatch_event_rule.asg_terminate_success.name
+  target_id = "incident-event-router-terminate-lifecycle"
+  arn       = aws_lambda_function.incident_event_router.arn
+}
+resource "aws_lambda_permission" "allow_eventbridge_lifecycle" {
+  statement_id  = "AllowEventBridgeLifecycleRouter"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.incident_event_router.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.asg_launch_success.arn
+}
+resource "aws_lambda_permission" "allow_eventbridge_lifecycle_terminate" {
+  statement_id  = "AllowEventBridgeLifecycleTerminateRouter"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.incident_event_router.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.asg_terminate_success.arn
 }
 
 # Per-instance CPU alarms are created after successful ASG launches and deleted after termination.
@@ -277,6 +411,14 @@ data "archive_file" "alarm_manager_zip" {
   source {
     content  = file("${path.module}/alarm_manager.py")
     filename = "alarm_manager.py"
+  }
+}
+data "archive_file" "event_router_zip" {
+  type        = "zip"
+  output_path = "${path.module}/event_router.zip"
+  source {
+    content  = file("${path.module}/event_router.py")
+    filename = "event_router.py"
   }
 }
 

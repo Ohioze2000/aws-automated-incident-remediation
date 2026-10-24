@@ -13,6 +13,7 @@ class IncidentPipelineContractTests(unittest.TestCase):
             ROOT / "modules/monitoring/dispatcher.py",
             ROOT / "modules/monitoring/remediation_worker.py",
             ROOT / "modules/monitoring/alarm_manager.py",
+            ROOT / "modules/monitoring/event_router.py",
             ROOT / "validate_infra.py",
         ):
             ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
@@ -22,11 +23,42 @@ class IncidentPipelineContractTests(unittest.TestCase):
         self.assertIn("attribute_not_exists(incident_id)", source)
         self.assertIn("StateChangeTime", source)
 
+    def test_target_health_event_carries_original_instance_into_dynamodb(self):
+        router = (ROOT / "modules/monitoring/event_router.py").read_text(encoding="utf-8")
+        terraform = (ROOT / "modules/monitoring/production_pipeline.tf").read_text(encoding="utf-8")
+        self.assertIn('"ELB Target Health State Change"', router)
+        self.assertIn('"original_instance_id": instance_id', router)
+        self.assertIn('"asg_instance_ids_at_detection": _asg_snapshot_ids()', router)
+        self.assertIn('"target-health" = { state = ["unhealthy"] }', terraform)
+        self.assertIn('"${var.env_prefix}-asg-lifecycle-events"', terraform)
+
+    def test_alb_alarm_does_not_create_duplicate_group_scoped_incident(self):
+        dispatcher = (ROOT / "modules/monitoring/dispatcher.py").read_text(encoding="utf-8")
+        self.assertIn('if _signal(alarm_name) == "alb_health":', dispatcher)
+        self.assertIn("target-specific EventBridge events are authoritative", dispatcher)
+
+    def test_worker_correlates_native_asg_replacement_and_verifies_replacement_target(self):
+        worker = (ROOT / "modules/monitoring/remediation_worker.py").read_text(encoding="utf-8")
+        terraform = (ROOT / "modules/monitoring/production_pipeline.tf").read_text(encoding="utf-8")
+        self.assertIn('"REPLACEMENT_ALREADY_STARTED"', worker)
+        self.assertIn('"replacement_instance_id"', worker)
+        self.assertIn('"RECOVERY_VERIFIED"', worker)
+        self.assertIn('"dynamodb:Query"', terraform)
+        self.assertIn('LIFECYCLE_TABLE_NAME', terraform)
+
+    def test_slack_outcome_includes_original_replacement_and_initiator(self):
+        worker = (ROOT / "modules/monitoring/remediation_worker.py").read_text(encoding="utf-8")
+        router = (ROOT / "modules/monitoring/event_router.py").read_text(encoding="utf-8")
+        self.assertIn("*Original instance:*", worker)
+        self.assertIn("*Replacement instance:*", worker)
+        self.assertIn("*Remediation initiator:*", worker)
+        self.assertIn("_send_detection_alert(item)", router)
+
     def test_worker_claim_is_bounded_and_verified(self):
         source = (ROOT / "modules/monitoring/remediation_worker.py").read_text(encoding="utf-8")
         self.assertIn("ConditionExpression=", source)
         self.assertIn("MAX_ATTEMPTS", source)
-        self.assertIn("VERIFICATION_FAILED", source)
+        self.assertIn("RECOVERY_FAILED", source)
         self.assertIn('if signal != "alb_health":', source)
         self.assertIn('"OBSERVE_ONLY"', source)
 

@@ -78,6 +78,15 @@ def lambda_handler(event, context):
         alarm_arn = message.get("AlarmArn", alarm_name or "unknown")
         if not alarm_name or not state_time:
             raise ValueError("CloudWatch alarm message lacks AlarmName or StateChangeTime")
+        # ALB target-health incidents are created from the target-specific EventBridge event.
+        # Do not create a second group-scoped incident that could race and trigger duplicate remediation.
+        if _signal(alarm_name) == "alb_health":
+            LOG.info(
+                "ALB alarm notification observed but not dispatched as a separate incident; "
+                "target-specific EventBridge events are authoritative alarm=%s state_time=%s",
+                alarm_name, state_time,
+            )
+            continue
         incident_id = "INC-" + hashlib.sha256(f"{alarm_arn}|{state_time}".encode()).hexdigest()[:24].upper()
         dimensions = {
             item.get("name"): item.get("value")
