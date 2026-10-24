@@ -210,7 +210,8 @@ resource "aws_iam_role_policy" "event_router_policy" {
     Version = "2012-10-17"
     Statement = [
       { Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:UpdateItem"], Resource = aws_dynamodb_table.incidents.arn },
-      { Effect = "Allow", Action = ["dynamodb:PutItem"], Resource = aws_dynamodb_table.asg_lifecycle_events.arn },
+      { Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem"], Resource = aws_dynamodb_table.asg_lifecycle_events.arn },
+      { Effect = "Allow", Action = ["dynamodb:GetItem"], Resource = aws_dynamodb_table.incidents.arn },
       { Effect = "Allow", Action = ["autoscaling:DescribeAutoScalingGroups"], Resource = "*" },
       { Effect = "Allow", Action = ["lambda:InvokeFunction"], Resource = aws_lambda_function.remediation_worker.arn }
     ]

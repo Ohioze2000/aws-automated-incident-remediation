@@ -33,7 +33,11 @@ def _send_incident_alert(item):
         f"*Resource:* `{item.get('instance_id') or 'not instance-scoped'}`\n"
         f"*Region:* `{item['region']}`\n"
         f"*Reason:* {item['reason']}\n"
-        "*Status:* Incident accepted; remediation decision/verification is pending."
+        + (
+            "*Status:* CloudWatch ALB alarm notification only. Target-specific EventBridge events remain authoritative for remediation; this notification will not start a second worker.\n"
+            if item.get("notification_only")
+            else "*Status:* Incident accepted; remediation decision/verification is pending."
+        )
     )
     request = urllib.request.Request(
         webhook, data=json.dumps({"text": message}).encode("utf-8"),
@@ -42,6 +46,61 @@ def _send_incident_alert(item):
     with urllib.request.urlopen(request, timeout=5) as response:
         if response.status < 200 or response.status >= 300:
             raise RuntimeError(f"Slack webhook returned HTTP {response.status}")
+
+
+def _handle_alb_alarm_notification(alarm_name, alarm_arn, state_time, message):
+    """Persist and notify a group-scoped ALB alarm without starting a competing worker."""
+    incident_id = "INC-" + hashlib.sha256(f"{alarm_arn}|{state_time}".encode()).hexdigest()[:24].upper()
+    now = datetime.now(timezone.utc)
+    item = {
+        "incident_id": incident_id,
+        "alarm_arn": alarm_arn,
+        "alarm_name": alarm_name,
+        "state_change_time": state_time,
+        "signal_type": "alb_health",
+        "instance_id": "",
+        "dimensions": {
+            entry.get("name"): entry.get("value")
+            for entry in message.get("Trigger", {}).get("Dimensions", [])
+            if entry.get("name") and entry.get("value")
+        },
+        "region": message.get("Region", os.environ.get("AWS_REGION", "us-east-1")),
+        "reason": message.get("NewStateReason", "ALB unhealthy-target alarm entered ALARM"),
+        "environment": ENV_PREFIX,
+        "status": "ALARM_NOTIFICATION_ONLY",
+        "notification_only": True,
+        "attempt_count": 0,
+        "created_at": now.isoformat(),
+        "ttl": int(now.timestamp()) + int(os.environ.get("INCIDENT_TTL_DAYS", "90")) * 86400,
+    }
+    try:
+        TABLE.put_item(Item=item, ConditionExpression="attribute_not_exists(incident_id)")
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+        existing = TABLE.get_item(Key={"incident_id": incident_id}, ConsistentRead=True).get("Item", {})
+        if existing.get("incident_alert_status") == "DELIVERED":
+            LOG.info("Duplicate ALB alarm notification suppressed incident_id=%s", incident_id)
+            return
+        item = existing or item
+
+    try:
+        _send_incident_alert(item)
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET incident_alert_status = :s, incident_alerted_at = :t",
+            ExpressionAttributeValues={":s": "DELIVERED", ":t": datetime.now(timezone.utc).isoformat()},
+        )
+        LOG.info("ALB alarm notification delivered incident_id=%s alarm=%s", incident_id, alarm_name)
+    except Exception as notify_exc:
+        LOG.exception("ALB alarm Slack notification failed incident_id=%s", incident_id)
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET incident_alert_status = :s, incident_alert_error = :e",
+            ExpressionAttributeValues={":s": "FAILED", ":e": type(notify_exc).__name__},
+        )
+        # Force SNS/Lambda retry so the persisted FAILED notification can be retried idempotently.
+        raise
 
 
 def _signal(alarm_name: str) -> str:
@@ -78,14 +137,11 @@ def lambda_handler(event, context):
         alarm_arn = message.get("AlarmArn", alarm_name or "unknown")
         if not alarm_name or not state_time:
             raise ValueError("CloudWatch alarm message lacks AlarmName or StateChangeTime")
-        # ALB target-health incidents are created from the target-specific EventBridge event.
-        # Do not create a second group-scoped incident that could race and trigger duplicate remediation.
+        # Always notify on the CloudWatch ALB alarm as a fallback. This record is
+        # notification-only: the target-specific EventBridge event remains the sole
+        # source that can start ALB remediation, preventing competing workers.
         if _signal(alarm_name) == "alb_health":
-            LOG.info(
-                "ALB alarm notification observed but not dispatched as a separate incident; "
-                "target-specific EventBridge events are authoritative alarm=%s state_time=%s",
-                alarm_name, state_time,
-            )
+            _handle_alb_alarm_notification(alarm_name, alarm_arn, state_time, message)
             continue
         incident_id = "INC-" + hashlib.sha256(f"{alarm_arn}|{state_time}".encode()).hexdigest()[:24].upper()
         dimensions = {
@@ -122,6 +178,24 @@ def lambda_handler(event, context):
                 Key={"incident_id": incident_id}, ConsistentRead=True
             ).get("Item", {})
             if existing.get("status") != "DISPATCH_FAILED":
+                # A previous delivery may have persisted the incident but failed to
+                # send Slack. Retry notification independently without redispatching
+                # a worker that may already be processing or completed.
+                if existing and existing.get("incident_alert_status") != "DELIVERED":
+                    try:
+                        _send_incident_alert(existing)
+                        TABLE.update_item(
+                            Key={"incident_id": incident_id},
+                            UpdateExpression="SET incident_alert_status = :s, incident_alerted_at = :t REMOVE incident_alert_error",
+                            ExpressionAttributeValues={":s": "DELIVERED", ":t": datetime.now(timezone.utc).isoformat()},
+                        )
+                    except Exception as notify_exc:
+                        LOG.exception("Retry of Slack alert failed incident_id=%s", incident_id)
+                        TABLE.update_item(
+                            Key={"incident_id": incident_id},
+                            UpdateExpression="SET incident_alert_status = :s, incident_alert_error = :e",
+                            ExpressionAttributeValues={":s": "FAILED", ":e": type(notify_exc).__name__},
+                        )
                 LOG.info("Duplicate alarm delivery suppressed incident_id=%s status=%s", incident_id, existing.get("status", "missing"))
                 continue
             try:
@@ -167,6 +241,22 @@ def lambda_handler(event, context):
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={":s": "DISPATCHED", ":t": datetime.now(timezone.utc).isoformat()},
         )
+        # Attempt the detection notification before invoking the worker. A Lambda
+        # dispatch failure must not prevent operators from hearing about the alarm.
+        try:
+            _send_incident_alert(item)
+            TABLE.update_item(
+                Key={"incident_id": incident_id},
+                UpdateExpression="SET incident_alert_status = :s, incident_alerted_at = :t",
+                ExpressionAttributeValues={":s": "DELIVERED", ":t": datetime.now(timezone.utc).isoformat()},
+            )
+        except Exception as notify_exc:
+            LOG.exception("Initial Slack alert failed for incident %s", incident_id)
+            TABLE.update_item(
+                Key={"incident_id": incident_id},
+                UpdateExpression="SET incident_alert_status = :s, incident_alert_error = :e",
+                ExpressionAttributeValues={":s": "FAILED", ":e": type(notify_exc).__name__},
+            )
         try:
             lam.invoke(
                 FunctionName=WORKER_ARN,
@@ -182,20 +272,5 @@ def lambda_handler(event, context):
                 ExpressionAttributeValues={":s": "DISPATCH_FAILED", ":e": "Worker invocation failed", ":t": datetime.now(timezone.utc).isoformat()},
             )
             raise
-        # Initial alert is best-effort: notification failure must not block remediation.
-        try:
-            _send_incident_alert(item)
-            TABLE.update_item(
-                Key={"incident_id": incident_id},
-                UpdateExpression="SET incident_alert_status = :s, incident_alerted_at = :t",
-                ExpressionAttributeValues={":s": "DELIVERED", ":t": datetime.now(timezone.utc).isoformat()},
-            )
-        except Exception as notify_exc:
-            LOG.exception("Initial Slack alert failed for incident %s", incident_id)
-            TABLE.update_item(
-                Key={"incident_id": incident_id},
-                UpdateExpression="SET incident_alert_status = :s, incident_alert_error = :e",
-                ExpressionAttributeValues={":s": "FAILED", ":e": type(notify_exc).__name__},
-            )
         LOG.info("Incident dispatched incident_id=%s signal=%s", incident_id, item["signal_type"])
     return {"status": "accepted"}

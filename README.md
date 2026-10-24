@@ -64,3 +64,17 @@ To syntax-check the rendered user-data template, replace `${app_archive_url}` an
 ## End-to-end test evidence
 
 Test one signal at a time and retain: CloudWatch alarm history, SNS delivery, dispatcher logs, DynamoDB incident item, worker logs, ALB target health/ASG membership, verification result, Slack message, and DLQ state. Confirm `InstanceId` survives from the CPU alarm's `Trigger.Dimensions` through the incident item. Do not claim automatic CPU/memory/disk/application remediation until an explicitly safe policy and signal-specific verification have been implemented and tested.
+
+
+## Incident and replacement Slack notifications
+
+The notification pipeline has two independent ALB detection paths by design:
+
+- The target-specific EventBridge `ELB Target Health State Change` route persists the affected instance ID, attempts an instance-specific detection alert, and then invokes the remediation worker.
+- The CloudWatch ALB alarm SNS route sends a deduplicated, **notification-only** fallback alert. It does not invoke the worker, so it cannot race the target-specific route or trigger a second termination.
+
+Successful Auto Scaling launch and termination lifecycle events are also persisted and sent to Slack. A launch notification identifies the new instance but explicitly does **not** claim recovery. The worker's final message remains the recovery verdict and must be based on target health and capacity verification.
+
+Detection notification is attempted after the incident is durably recorded and before worker invocation. This means an invocation failure no longer suppresses the first detection attempt. Failed lifecycle-notification deliveries are recorded and surfaced to EventBridge for retry. The event-router role therefore needs incident-table `GetItem` plus lifecycle-table `GetItem` and `UpdateItem` permissions in addition to its write permissions.
+
+After applying this revision, verify `/aws/lambda/<env>-incident-dispatcher`, `/aws/lambda/<env>-incident-event-router`, and `/aws/lambda/<env>-remediation-worker`; inspect `incident_alert_status`, `notification_status`, and `notification_error` fields in DynamoDB if Slack is still silent.

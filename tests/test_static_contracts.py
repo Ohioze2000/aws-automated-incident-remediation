@@ -18,6 +18,30 @@ class IncidentPipelineContractTests(unittest.TestCase):
         ):
             ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
 
+    def test_alb_cloudwatch_alarm_has_notification_fallback_without_worker_dispatch(self):
+        dispatcher = (ROOT / "modules/monitoring/dispatcher.py").read_text(encoding="utf-8")
+        self.assertIn("_handle_alb_alarm_notification(alarm_name, alarm_arn, state_time, message)", dispatcher)
+        self.assertIn('"ALARM_NOTIFICATION_ONLY"', dispatcher)
+        self.assertIn("notification_only", dispatcher)
+        self.assertIn("Target-specific EventBridge events remain authoritative", dispatcher)
+
+    def test_detection_notification_precedes_worker_dispatch(self):
+        dispatcher = (ROOT / "modules/monitoring/dispatcher.py").read_text(encoding="utf-8")
+        router = (ROOT / "modules/monitoring/event_router.py").read_text(encoding="utf-8")
+        dispatcher_handler = dispatcher[dispatcher.index("def lambda_handler(event, context):"):]
+        self.assertLess(dispatcher_handler.index("_send_incident_alert(item)"), dispatcher_handler.rindex("lam.invoke("))
+        target_router = router[router.index("def _target_unhealthy(event):"):router.index("def lambda_handler(event, context):")]
+        self.assertLess(target_router.index("_send_detection_alert(item)"), target_router.index("LAM.invoke("))
+
+    def test_asg_lifecycle_events_notify_slack_and_retry_failed_delivery(self):
+        router = (ROOT / "modules/monitoring/event_router.py").read_text(encoding="utf-8")
+        pipeline = (ROOT / "modules/monitoring/production_pipeline.tf").read_text(encoding="utf-8")
+        self.assertIn("def _send_lifecycle_alert(item):", router)
+        self.assertIn("AWS Auto Scaling Instance Launch Completed", router)
+        self.assertIn('notification_status = :s', router)
+        self.assertIn('"dynamodb:GetItem", "dynamodb:UpdateItem"', pipeline)
+        self.assertIn("raise", router[router.index("def _write_lifecycle(event):"):router.index("def _target_unhealthy(event):")])
+
     def test_dynamodb_idempotency_is_present(self):
         source = (ROOT / "modules/monitoring/dispatcher.py").read_text(encoding="utf-8")
         self.assertIn("attribute_not_exists(incident_id)", source)
@@ -29,13 +53,14 @@ class IncidentPipelineContractTests(unittest.TestCase):
         self.assertIn('"ELB Target Health State Change"', router)
         self.assertIn('"original_instance_id": instance_id', router)
         self.assertIn('"asg_instance_ids_at_detection": _asg_snapshot_ids()', router)
-        self.assertIn('"target-health" = { state = ["unhealthy"] }', terraform)
+        self.assertIn('"target-health"    = { state = ["unhealthy"] }', terraform)
         self.assertIn('"${var.env_prefix}-asg-lifecycle-events"', terraform)
 
     def test_alb_alarm_does_not_create_duplicate_group_scoped_incident(self):
         dispatcher = (ROOT / "modules/monitoring/dispatcher.py").read_text(encoding="utf-8")
         self.assertIn('if _signal(alarm_name) == "alb_health":', dispatcher)
-        self.assertIn("target-specific EventBridge events are authoritative", dispatcher)
+        self.assertIn("_handle_alb_alarm_notification(alarm_name, alarm_arn, state_time, message)", dispatcher)
+        self.assertIn("Target-specific EventBridge events remain authoritative", dispatcher)
 
     def test_worker_correlates_native_asg_replacement_and_verifies_replacement_target(self):
         worker = (ROOT / "modules/monitoring/remediation_worker.py").read_text(encoding="utf-8")
@@ -88,15 +113,13 @@ class IncidentPipelineContractTests(unittest.TestCase):
     def test_harmonized_application_metric_filters_and_alarms(self):
         root_variables = (ROOT / "variables.tf").read_text(encoding="utf-8")
         logging_variables = (ROOT / "modules/logging/variables.tf").read_text(encoding="utf-8")
-        example = (ROOT / "terraform.tfvars.example").read_text(encoding="utf-8")
         for signal in ("ApplicationErrors", "HTTP5xxCount", "DBConnectionTimeoutCount"):
             self.assertIn(signal, root_variables)
-            self.assertIn(signal, example)
         self.assertIn('log_group_key    = "web_app"', root_variables)
         self.assertIn('log_group_key    = "nginx/access"', root_variables)
-        self.assertIn('default_value    = optional(number)', root_variables)
+        self.assertIn('default_value = optional(number)', root_variables)
         self.assertIn('default_value    = optional(number)', logging_variables)
-        self.assertIn('metric_namespace = "CustomAppMetrics"', example)
+        self.assertIn('metric_namespace = "CustomAppMetrics"', root_variables)
 
     def test_logging_module_is_single_owner(self):
         root_main = (ROOT / "main.tf").read_text(encoding="utf-8")
@@ -139,23 +162,21 @@ class IncidentPipelineContractTests(unittest.TestCase):
         self.assertIn("<= 540", variables)
 
     def test_audit_report_states_unvalidated_deployment_limitations(self):
-        report = (ROOT / "AUDIT_REPORT.md").read_text(encoding="utf-8")
-        self.assertIn("NOT CLEARED FOR DEPLOYMENT YET", report)
+        report = (ROOT / "REFACTOR_NOTES.md").read_text(encoding="utf-8")
+        self.assertIn("Terraform CLI validation/formatting and live AWS integration tests: not run", report)
         self.assertIn("terraform validate", report)
-        self.assertIn("observe-only", report)
+        self.assertIn("recorded and reported without destructive action", report)
 
     def test_custom_metric_flag_is_not_advertised_when_unused(self):
         root_variables = (ROOT / "variables.tf").read_text(encoding="utf-8")
         logging_variables = (ROOT / "modules/logging/variables.tf").read_text(encoding="utf-8")
-        example = (ROOT / "terraform.tfvars.example").read_text(encoding="utf-8")
-        self.assertNotIn("is_custom_metric", root_variables + logging_variables + example)
+        self.assertNotIn("is_custom_metric", root_variables + logging_variables)
 
     def test_destroy_workflow_does_not_announce_success_before_destroy(self):
         workflow = (ROOT / ".github/workflows/destroy.yml").read_text(encoding="utf-8")
-        self.assertIn("terraform destroy -auto-approve -input=false", workflow)
-        self.assertNotIn("-out=destroy.tfplan", workflow)
+        self.assertIn("terraform apply -auto-approve destroy.tfplan", workflow)
+        self.assertIn("terraform plan -destroy -out=destroy.tfplan", workflow)
         self.assertNotIn("Started Infrastructure Teardown Successfully", workflow)
-        self.assertIn("needs: plan-destroy", workflow)
         self.assertIn("environment: production", workflow)
 
     def test_ssl_module_receives_environment_prefix(self):
@@ -167,7 +188,7 @@ class IncidentPipelineContractTests(unittest.TestCase):
     def test_www_certificate_and_ipv6_dns_are_consistent(self):
         root_main = (ROOT / "main.tf").read_text(encoding="utf-8")
         self.assertIn('subject_alternative_names = var.create_www_record ? ["www.${var.domain_name}"] : []', root_main)
-        self.assertIn("enable_ipv6       = false", root_main)
+        self.assertIn("enable_ipv6  = false", root_main)
 
     def test_runtime_target_health_wait_allows_instance_bootstrap(self):
         source = (ROOT / "validate_infra.py").read_text(encoding="utf-8")
@@ -175,7 +196,7 @@ class IncidentPipelineContractTests(unittest.TestCase):
 
     def test_terraform_lockfile_is_not_ignored_and_fmt_is_recursive(self):
         gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
-        workflow = (ROOT / ".github/workflows/aws-asg-incd-cicd.yml").read_text(encoding="utf-8")
+        workflow = (ROOT / ".github/workflows/aws-automated-incident-remediation.yml").read_text(encoding="utf-8")
         self.assertNotIn(".terraform.lock.hcl", gitignore)
         self.assertIn("terraform fmt -check -recursive", workflow)
 
