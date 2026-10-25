@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import urllib.request
 from datetime import datetime, timezone
 
@@ -40,9 +41,10 @@ def _send_detection_alert(item):
         f"*Signal:* `{item['signal_type']}`\n"
         f"*Original instance:* `{item['original_instance_id']}`\n"
         f"*Target group:* `{item['target_group_arn']}`\n"
-        f"*CloudWatch alarm:* `{item.get('cloudwatch_alarm_name', 'creation pending; check incident record')}`\n"
+        f"*CloudWatch alarm:* `{item.get('cloudwatch_alarm_name', 'unknown')}`\n"
+        f"*CloudWatch state:* `ALARM` confirmed at `{item.get('cloudwatch_alarm_state_at', 'unknown')}`\n"
         f"*Reason:* {item['reason']}\n"
-        "*Status:* Target-specific incident persisted; safety evaluation and recovery verification are pending."
+        "*Status:* Alarm-confirmed incident; remediation and recovery verification are separate and still pending."
     )
     request = urllib.request.Request(SLACK_WEBHOOK_URL, data=json.dumps({"text": message}).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(request, timeout=5) as response:
@@ -72,13 +74,13 @@ def _send_lifecycle_alert(item):
         headline = "AWS Auto Scaling Lifecycle Event"
         meaning = "Review the ASG lifecycle event and incident evidence."
     message = (
-        f"*{headline}*\\n"
-        f"*Environment:* `{ENV_PREFIX}`\\n"
-        f"*Auto Scaling Group:* `{item.get('asg_name', ASG_NAME)}`\\n"
-        f"*Event:* `{event_type}`\\n"
-        f"*Instance:* `{instance_id}`\\n"
-        f"*Event time:* `{item.get('event_time', 'unknown')}`\\n"
-        f"*Region:* `{REGION}`\\n"
+        f"*{headline}*\n"
+        f"*Environment:* `{ENV_PREFIX}`\n"
+        f"*Auto Scaling Group:* `{item.get('asg_name', ASG_NAME)}`\n"
+        f"*Event:* `{event_type}`\n"
+        f"*Instance:* `{instance_id}`\n"
+        f"*Event time:* `{item.get('event_time', 'unknown')}`\n"
+        f"*Region:* `{REGION}`\n"
         f"*Interpretation:* {meaning}"
     )
     request = urllib.request.Request(
@@ -164,15 +166,13 @@ def _write_lifecycle(event):
 
 
 def _ensure_instance_unhealthy_alarm(instance_id, target_group_arn, incident_id, event_time, reason):
-    """Create a retained per-incident CloudWatch alarm and publish its trigger metric.
+    """Create the per-incident alarm, but do not publish its metric yet.
 
-    The native AWS/ApplicationELB alarm remains the target-group-level signal. This
-    custom alarm gives each target-specific EventBridge incident a reviewable alarm
-    name that includes the affected instance ID and a unique incident suffix.
-    Actions are disabled intentionally because this route already sends the direct
-    Slack detection alert; enabling SNS here would create a duplicate notification.
+    The caller persists the alarm-to-incident correlation before publishing the
+    trigger metric. This ordering prevents a fast CloudWatch state-change event
+    from arriving before the durable incident mapping exists.
     """
-    alarm_name = f"{ENV_PREFIX}-{instance_id}-Unhealthy-Target-{incident_id[-8:]}"
+    alarm_name = f"{ENV_PREFIX}-{instance_id}-Unhealthy-Target-{incident_id}"
     dimensions = [
         {"Name": "Environment", "Value": ENV_PREFIX},
         {"Name": "TargetGroupArn", "Value": target_group_arn},
@@ -184,7 +184,7 @@ def _ensure_instance_unhealthy_alarm(instance_id, target_group_arn, incident_id,
         AlarmDescription=(
             f"Target-specific unhealthy incident for instance {instance_id}; "
             f"target group {target_group_arn}; incident {incident_id}; reason: {reason}. "
-            "Review the matching incident record and event-router logs."
+            "The incident alert is emitted only after this alarm enters ALARM."
         )[:1024],
         ActionsEnabled=False,
         MetricName="UnhealthyTargetDetected",
@@ -198,19 +198,260 @@ def _ensure_instance_unhealthy_alarm(instance_id, target_group_arn, incident_id,
         ComparisonOperator="GreaterThanOrEqualToThreshold",
         TreatMissingData="notBreaching",
     )
-    metric_timestamp = datetime.fromisoformat(event_time.replace("Z", "+00:00")).astimezone(timezone.utc)
+    LOG.info("Created per-incident CloudWatch alarm=%s incident_id=%s", alarm_name, incident_id)
+    return alarm_name, dimensions
+
+
+def _publish_instance_unhealthy_metric(dimensions, incident_id):
+    """Publish the event signal after the alarm-to-incident mapping is durable."""
     CW.put_metric_data(
         Namespace="SelfHealing/TargetHealth",
         MetricData=[{
             "MetricName": "UnhealthyTargetDetected",
             "Dimensions": dimensions,
-            "Timestamp": metric_timestamp,
+            # Use publish time so delayed event delivery does not place the datapoint
+            # outside the alarm's evaluation window. Original event time stays on record.
+            "Timestamp": datetime.now(timezone.utc),
             "Value": 1.0,
             "Unit": "Count",
         }],
     )
-    LOG.info("Created and published CloudWatch target alarm=%s instance_id=%s incident_id=%s", alarm_name, instance_id, incident_id)
-    return alarm_name
+    LOG.info("Published target-health metric incident_id=%s", incident_id)
+
+
+def _send_alarm_recovered_alert(item, alarm_name, state_at):
+    if not SLACK_WEBHOOK_URL:
+        raise RuntimeError("SLACK_WEBHOOK_URL is not configured")
+    message = (
+        "🟢 *CloudWatch Alarm Recovered*\n"
+        f"*Alarm:* `{alarm_name}`\n"
+        "*State:* `ALARM → OK`\n"
+        f"*Incident:* `{item['incident_id']}`\n"
+        f"*State-change time:* `{state_at}`\n"
+        "*Status:* The monitored alarm condition has cleared. Application recovery verification is pending."
+    )
+    request = urllib.request.Request(SLACK_WEBHOOK_URL, data=json.dumps({"text": message}).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(request, timeout=5) as response:
+        if response.status < 200 or response.status >= 300:
+            raise RuntimeError(f"Slack webhook returned HTTP {response.status}")
+
+
+
+def _maybe_send_verified_success(incident_id):
+    """Send success only after CloudWatch has confirmed OK and all recovery checks passed."""
+    response = TABLE.get_item(Key={"incident_id": incident_id}, ConsistentRead=True)
+    item = response.get("Item")
+    if not item:
+        raise RuntimeError(f"No incident record found for verified-success notification: {incident_id}")
+
+    checks_passed = (
+        item.get("status") == "RECOVERY_VERIFIED"
+        and item.get("target_health_check") == "PASSED"
+        and item.get("application_health_check") == "PASSED"
+        and item.get("capacity_check") == "PASSED"
+        and bool(item.get("replacement_instance_id"))
+    )
+    cloudwatch_confirmed = (
+        item.get("cloudwatch_alarm_state") == "OK"
+        and item.get("alarm_recovery_notification_status") == "DELIVERED"
+    )
+    if not checks_passed or not cloudwatch_confirmed:
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET verified_success_notification_status = :pending, updated_at = :at",
+            ExpressionAttributeValues={":pending": "PENDING_CLOUDWATCH_OK", ":at": datetime.now(timezone.utc).isoformat()},
+        )
+        LOG.info(
+            "Verified success notification deferred incident_id=%s checks_passed=%s cloudwatch_confirmed=%s",
+            incident_id, checks_passed, cloudwatch_confirmed,
+        )
+        return {"status": "success_notification_deferred", "incident_id": incident_id}
+
+    try:
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET verified_success_notification_status = :claimed, verified_success_notification_claimed_at = :at",
+            ConditionExpression=(
+                "attribute_not_exists(verified_success_notification_status) "
+                "OR verified_success_notification_status = :failed "
+                "OR verified_success_notification_status = :pending"
+            ),
+            ExpressionAttributeValues={
+                ":claimed": "CLAIMED",
+                ":failed": "FAILED",
+                ":pending": "PENDING_CLOUDWATCH_OK",
+                ":at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            latest = TABLE.get_item(Key={"incident_id": incident_id}, ConsistentRead=True).get("Item", {})
+            if latest.get("verified_success_notification_status") == "DELIVERED":
+                return {"status": "verified_success_already_notified", "incident_id": incident_id}
+            raise RuntimeError(f"Verified-success notification claim is active; retry incident_id={incident_id}")
+        raise
+
+    message = (
+        "✅ *Remediation Successful — Recovery Verified*\n"
+        f"*Incident:* `{incident_id}`\n"
+        f"*Replacement instance:* `{item['replacement_instance_id']}`\n"
+        "*Target health:* Healthy\n"
+        "*Application health:* Passed\n"
+        "*Capacity verification:* Passed\n"
+        "*CloudWatch alarm:* `ALARM → OK` confirmed\n"
+        "*Outcome:* All configured recovery checks passed.\n"
+        f"*Evidence:* {item.get('verification_result', 'All configured checks passed.')}"
+    )
+    try:
+        if not SLACK_WEBHOOK_URL:
+            raise RuntimeError("SLACK_WEBHOOK_URL is not configured")
+        request = urllib.request.Request(
+            SLACK_WEBHOOK_URL, data=json.dumps({"text": message}).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            if response.status < 200 or response.status >= 300:
+                raise RuntimeError(f"Slack webhook returned HTTP {response.status}")
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET verified_success_notification_status = :delivered, verified_success_notified_at = :at",
+            ExpressionAttributeValues={":delivered": "DELIVERED", ":at": datetime.now(timezone.utc).isoformat()},
+        )
+    except Exception as exc:
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET verified_success_notification_status = :failed, verified_success_notification_error = :error",
+            ExpressionAttributeValues={":failed": "FAILED", ":error": type(exc).__name__},
+        )
+        LOG.exception("Verified-success Slack notification failed incident_id=%s", incident_id)
+        raise
+    return {"status": "verified_success_notified", "incident_id": incident_id}
+
+def _alarm_state_changed(event):
+    """Correlate ALARM/OK transitions, suppress stale events, and notify each transition separately."""
+    detail = event.get("detail", {})
+    alarm_name = detail.get("alarmName", "")
+    state = (detail.get("state") or {}).get("value", "")
+    state_at = _iso((detail.get("state") or {}).get("timestamp") or event.get("time"))
+    match = re.search(r"-Unhealthy-Target-(INC-[A-F0-9]{24})$", alarm_name)
+    if state not in {"ALARM", "OK"} or not match:
+        LOG.info("Ignoring non-target-incident alarm state event alarm=%s state=%s", alarm_name, state)
+        return {"status": "ignored"}
+
+    incident_id = match.group(1)
+    item = TABLE.get_item(Key={"incident_id": incident_id}, ConsistentRead=True).get("Item")
+    if not item:
+        raise RuntimeError(f"No incident record found for alarm {alarm_name} / {incident_id}")
+
+    # EventBridge delivery is at-least-once and can be out of order. Never allow an
+    # older state transition to overwrite a newer state already persisted.
+    previous_at = item.get("cloudwatch_alarm_state_at", "")
+    if previous_at and previous_at > state_at:
+        LOG.info("Ignoring stale alarm transition incident_id=%s state=%s at=%s newer=%s", incident_id, state, state_at, previous_at)
+        return {"status": "stale_event_ignored", "incident_id": incident_id, "alarm_name": alarm_name}
+
+    if state == "ALARM":
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET cloudwatch_alarm_state = :state, cloudwatch_alarm_state_at = :at, cloudwatch_alarm_name = :alarm",
+            ExpressionAttributeValues={":state": state, ":at": state_at, ":alarm": alarm_name},
+        )
+        status = item.get("incident_alert_status", "")
+        if status == "DELIVERED":
+            return {"status": "already_notified", "incident_id": incident_id, "alarm_name": alarm_name}
+        # An OK transition is not allowed to race ahead of the detection notification.
+        # EventBridge retries until the ALARM message has been delivered.
+        if item.get("alarm_recovery_notification_status") == "DELIVERED":
+            LOG.warning("ALARM event arrived after recorded recovery notification; not sending stale detection alert incident_id=%s", incident_id)
+            return {"status": "recovery_already_notified", "incident_id": incident_id}
+        now = datetime.now(timezone.utc)
+        claimed_at = item.get("incident_alert_claimed_at", "")
+        stale_claim = False
+        if status == "CLAIMED":
+            try:
+                stale_claim = not claimed_at or (now - datetime.fromisoformat(claimed_at.replace("Z", "+00:00"))).total_seconds() > 120
+            except ValueError:
+                stale_claim = True
+        if status == "CLAIMED" and not stale_claim:
+            raise RuntimeError(f"Incident notification claim is active; retry incident_id={incident_id}")
+        claim_values = {":claimed": "CLAIMED", ":failed": "FAILED", ":at": now.isoformat(), ":alarm": alarm_name}
+        if status == "CLAIMED" and stale_claim:
+            claim_condition = "incident_alert_status = :claimed AND incident_alert_claimed_at = :old_claimed_at"
+            claim_values[":old_claimed_at"] = claimed_at
+        else:
+            claim_condition = "attribute_not_exists(incident_alert_status) OR incident_alert_status = :failed"
+        try:
+            TABLE.update_item(
+                Key={"incident_id": incident_id},
+                UpdateExpression="SET incident_alert_status = :claimed, incident_alert_claimed_at = :at, cloudwatch_alarm_name = :alarm",
+                ConditionExpression=claim_condition,
+                ExpressionAttributeValues=claim_values,
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                latest = TABLE.get_item(Key={"incident_id": incident_id}, ConsistentRead=True).get("Item", {})
+                if latest.get("incident_alert_status") == "DELIVERED":
+                    return {"status": "already_notified", "incident_id": incident_id}
+                raise RuntimeError(f"Concurrent incident notification claim; retry incident_id={incident_id}")
+            raise
+        item = TABLE.get_item(Key={"incident_id": incident_id}, ConsistentRead=True).get("Item", item)
+        item["cloudwatch_alarm_name"] = alarm_name
+        item["cloudwatch_alarm_state_at"] = state_at
+        try:
+            _send_detection_alert(item)
+            TABLE.update_item(
+                Key={"incident_id": incident_id},
+                UpdateExpression="SET incident_alert_status = :delivered, incident_alerted_at = :at, cloudwatch_alarm_state = :state, cloudwatch_alarm_state_at = :state_at",
+                ExpressionAttributeValues={":delivered": "DELIVERED", ":at": now.isoformat(), ":state": "ALARM", ":state_at": state_at},
+            )
+        except Exception as exc:
+            LOG.exception("Alarm-gated Slack notification failed incident_id=%s", incident_id)
+            TABLE.update_item(
+                Key={"incident_id": incident_id},
+                UpdateExpression="SET incident_alert_status = :failed, incident_alert_error = :error",
+                ExpressionAttributeValues={":failed": "FAILED", ":error": type(exc).__name__},
+            )
+            raise
+        return {"status": "notified", "incident_id": incident_id, "alarm_name": alarm_name}
+
+    # Recovery alert is distinct from worker success: an OK alarm says only that the
+    # monitored condition cleared. The worker must still verify replacement, app, and capacity.
+    if item.get("incident_alert_status") != "DELIVERED":
+        raise RuntimeError(f"Alarm recovery arrived before incident detection delivery; retry incident_id={incident_id}")
+    if item.get("alarm_recovery_notification_status") == "DELIVERED":
+        success = _maybe_send_verified_success(incident_id)
+        return {"status": "recovery_already_notified", "incident_id": incident_id, "alarm_name": alarm_name, "verified_success": success.get("status")}
+    try:
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET alarm_recovery_notification_status = :claimed, alarm_recovery_notification_claimed_at = :at, cloudwatch_alarm_state = :state, cloudwatch_alarm_state_at = :state_at, cloudwatch_alarm_name = :alarm",
+            ConditionExpression="attribute_not_exists(alarm_recovery_notification_status) OR alarm_recovery_notification_status = :failed",
+            ExpressionAttributeValues={":claimed": "CLAIMED", ":failed": "FAILED", ":at": datetime.now(timezone.utc).isoformat(), ":state": "OK", ":state_at": state_at, ":alarm": alarm_name},
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            latest = TABLE.get_item(Key={"incident_id": incident_id}, ConsistentRead=True).get("Item", {})
+            if latest.get("alarm_recovery_notification_status") == "DELIVERED":
+                return {"status": "recovery_already_notified", "incident_id": incident_id}
+            raise RuntimeError(f"Recovery notification is already claimed; retry incident_id={incident_id}")
+        raise
+    try:
+        _send_alarm_recovered_alert(item, alarm_name, state_at)
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET alarm_recovery_notification_status = :delivered, alarm_recovered_at = :at, cloudwatch_alarm_state = :state, cloudwatch_alarm_state_at = :state_at",
+            ExpressionAttributeValues={":delivered": "DELIVERED", ":at": datetime.now(timezone.utc).isoformat(), ":state": "OK", ":state_at": state_at},
+        )
+    except Exception as exc:
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET alarm_recovery_notification_status = :failed, alarm_recovery_notification_error = :error",
+            ExpressionAttributeValues={":failed": "FAILED", ":error": type(exc).__name__},
+        )
+        LOG.exception("CloudWatch alarm recovery Slack notification failed incident_id=%s", incident_id)
+        raise
+    success = _maybe_send_verified_success(incident_id)
+    return {"status": "alarm_recovered_notified", "incident_id": incident_id, "alarm_name": alarm_name, "verified_success": success.get("status")}
 
 
 def _target_unhealthy(event):
@@ -268,14 +509,20 @@ def _target_unhealthy(event):
             if existing.get("cloudwatch_alarm_status") == "ALARM_PUBLISHED":
                 LOG.info("Duplicate target-health event suppressed incident_id=%s status=%s", incident_id, existing.get("status", "missing"))
                 return {"status": "duplicate", "incident_id": incident_id, "cloudwatch_alarm_name": existing.get("cloudwatch_alarm_name", "")}
-            alarm_name = _ensure_instance_unhealthy_alarm(
+            alarm_name, dimensions = _ensure_instance_unhealthy_alarm(
                 instance_id, target_group_arn, incident_id, event_time,
                 f"ELB target became unhealthy: {reason}. {description}".strip(),
             )
             TABLE.update_item(
                 Key={"incident_id": incident_id},
                 UpdateExpression="SET cloudwatch_alarm_name = :n, cloudwatch_alarm_status = :s REMOVE cloudwatch_alarm_error",
-                ExpressionAttributeValues={":n": alarm_name, ":s": "ALARM_PUBLISHED"},
+                ExpressionAttributeValues={":n": alarm_name, ":s": "ALARM_CREATED"},
+            )
+            _publish_instance_unhealthy_metric(dimensions, incident_id)
+            TABLE.update_item(
+                Key={"incident_id": incident_id},
+                UpdateExpression="SET cloudwatch_alarm_status = :s",
+                ExpressionAttributeValues={":s": "ALARM_PUBLISHED"},
             )
             LOG.info("Duplicate target-health event reconciled CloudWatch alarm incident_id=%s", incident_id)
             return {"status": "duplicate_alarm_reconciled", "incident_id": incident_id, "cloudwatch_alarm_name": alarm_name}
@@ -295,16 +542,23 @@ def _target_unhealthy(event):
 
     cloudwatch_alarm_error = None
     try:
-        cloudwatch_alarm_name = _ensure_instance_unhealthy_alarm(
+        cloudwatch_alarm_name, dimensions = _ensure_instance_unhealthy_alarm(
             instance_id, target_group_arn, incident_id, event_time,
             f"ELB target became unhealthy: {reason}. {description}".strip(),
         )
         item["cloudwatch_alarm_name"] = cloudwatch_alarm_name
-        item["cloudwatch_alarm_status"] = "ALARM_PUBLISHED"
+        item["cloudwatch_alarm_status"] = "ALARM_CREATED"
+        # Persist correlation before publishing the metric that can trigger an alarm event.
         TABLE.update_item(
             Key={"incident_id": incident_id},
             UpdateExpression="SET cloudwatch_alarm_name = :n, cloudwatch_alarm_status = :s REMOVE cloudwatch_alarm_error",
-            ExpressionAttributeValues={":n": cloudwatch_alarm_name, ":s": "ALARM_PUBLISHED"},
+            ExpressionAttributeValues={":n": cloudwatch_alarm_name, ":s": "ALARM_CREATED"},
+        )
+        _publish_instance_unhealthy_metric(dimensions, incident_id)
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET cloudwatch_alarm_status = :s",
+            ExpressionAttributeValues={":s": "ALARM_PUBLISHED"},
         )
     except Exception as alarm_exc:
         cloudwatch_alarm_error = alarm_exc
@@ -316,31 +570,11 @@ def _target_unhealthy(event):
             ExpressionAttributeValues={":s": "FAILED", ":e": type(alarm_exc).__name__},
         )
 
-    # Notify after persisting the incident but before worker dispatch. This way a
-    # dispatch failure cannot suppress the detection message. On a retry, avoid
-    # sending a duplicate detection alert if delivery was already recorded.
-    existing_alert_status = ""
-    if is_retry:
-        existing_alert_status = TABLE.get_item(
-            Key={"incident_id": incident_id}, ConsistentRead=True
-        ).get("Item", {}).get("incident_alert_status", "")
-    if existing_alert_status != "DELIVERED":
-        try:
-            _send_detection_alert(item)
-            TABLE.update_item(
-                Key={"incident_id": incident_id},
-                UpdateExpression="SET incident_alert_status = :s, incident_alerted_at = :t",
-                ExpressionAttributeValues={":s": "DELIVERED", ":t": datetime.now(timezone.utc).isoformat()},
-            )
-        except Exception as notify_exc:
-            LOG.exception("Target-health detection Slack alert failed incident_id=%s", incident_id)
-            TABLE.update_item(
-                Key={"incident_id": incident_id},
-                UpdateExpression="SET incident_alert_status = :s, incident_alert_error = :e",
-                ExpressionAttributeValues={":s": "FAILED", ":e": type(notify_exc).__name__},
-            )
+    # Target-specific detection Slack is deliberately NOT sent here. It is emitted
+    # only by _alarm_state_changed after the correlated CloudWatch alarm enters ALARM.
 
-    # Dispatch only after the durable record and detection notification attempt.
+    # Dispatch only after the durable incident/alarm correlation and metric publication
+    # attempt. Detection notification is handled asynchronously by the alarm-state route.
     # DISPATCHED is written before invoking asynchronously so a fast worker cannot
     # have the router overwrite PROCESSING.
     try:
@@ -358,9 +592,9 @@ def _target_unhealthy(event):
         )
         raise
     if cloudwatch_alarm_error is not None:
-        # Slack and worker dispatch have already been attempted. Returning an error
-        # asks EventBridge to retry; the duplicate path retries only alarm creation
-        # and will not launch a second worker or resend a delivered detection alert.
+        # Worker dispatch has been attempted. Returning an error asks EventBridge
+        # to retry alarm creation/publication; duplicate handling avoids a second
+        # worker dispatch unless the durable record explicitly says dispatch failed.
         raise RuntimeError("CloudWatch per-instance alarm creation failed; EventBridge retry requested") from cloudwatch_alarm_error
     LOG.info("Target-health incident %s and dispatched incident_id=%s original_instance_id=%s cloudwatch_alarm=%s", "retried" if is_retry else "persisted", incident_id, instance_id, cloudwatch_alarm_name)
     return {"status": "retried" if is_retry else "accepted", "incident_id": incident_id, "instance_id": instance_id, "cloudwatch_alarm_name": cloudwatch_alarm_name}
@@ -371,6 +605,13 @@ def lambda_handler(event, context):
     source = event.get("source", "")
     if source == "aws.elasticloadbalancing" and detail_type == "ELB Target Health State Change":
         return _target_unhealthy(event)
+    if source == "aws.cloudwatch" and detail_type == "CloudWatch Alarm State Change":
+        return _alarm_state_changed(event)
+    if source == "aws.self-healing" and detail_type == "Remediation Verification Completed":
+        incident_id = (event.get("detail") or {}).get("incident_id")
+        if not incident_id:
+            raise ValueError("Remediation Verification Completed event requires detail.incident_id")
+        return _maybe_send_verified_success(incident_id)
     if source == "aws.autoscaling" and detail_type in {
         "EC2 Instance Launch Successful",
         "EC2 Instance Terminate Successful",

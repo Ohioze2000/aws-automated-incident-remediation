@@ -1,3 +1,7 @@
+data "aws_partition" "current" {}
+data "aws_region" "current" {}
+data "aws_caller_identity" "current" {}
+
 # Production incident path: SNS -> idempotent dispatcher -> DynamoDB -> worker.
 resource "aws_dynamodb_table" "incidents" {
   name         = "${var.env_prefix}-incidents"
@@ -96,7 +100,8 @@ resource "aws_iam_role_policy" "worker_policy" {
       { Effect = "Allow", Action = ["elasticloadbalancing:DescribeTargetHealth"], Resource = "*" },
       { Effect = "Allow", Action = ["autoscaling:DescribeAutoScalingGroups", "autoscaling:TerminateInstanceInAutoScalingGroup"], Resource = "*" },
       { Effect = "Allow", Action = ["ec2:DescribeInstances"], Resource = "*" },
-      { Effect = "Allow", Action = ["sqs:SendMessage"], Resource = aws_sqs_queue.worker_failure_dlq.arn }
+      { Effect = "Allow", Action = ["sqs:SendMessage"], Resource = aws_sqs_queue.worker_failure_dlq.arn },
+      { Effect = "Allow", Action = ["lambda:InvokeFunction"], Resource = "arn:${data.aws_partition.current.partition}:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${var.env_prefix}-incident-event-router" }
     ]
   })
 }
@@ -134,6 +139,8 @@ resource "aws_lambda_function" "remediation_worker" {
       LIFECYCLE_TABLE_NAME         = aws_dynamodb_table.asg_lifecycle_events.name
       SLACK_WEBHOOK_URL            = var.slack_webhook_url
       TARGET_GROUP_ARN             = var.target_group_arn
+      APP_HEALTHCHECK_URL          = var.app_healthcheck_url
+      ROUTER_FUNCTION_NAME         = "${var.env_prefix}-incident-event-router"
       ASG_NAME                     = var.asg_name
       MAX_REMEDIATION_ATTEMPTS     = tostring(var.max_remediation_attempts)
       VERIFICATION_TIMEOUT_SECONDS = tostring(var.verification_timeout_seconds)
@@ -271,6 +278,85 @@ resource "aws_lambda_permission" "allow_eventbridge_target_health" {
   function_name = aws_lambda_function.incident_event_router.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.elb_target_health_unhealthy.arn
+}
+
+# Only the per-incident target alarm state transition may release the incident-detection
+# Slack notification. Lifecycle messages remain immediate and independent.
+resource "aws_cloudwatch_event_rule" "target_incident_alarm_state" {
+  name        = "${var.env_prefix}-target-incident-alarm-state"
+  description = "Route ALARM and OK transitions for target-specific incident alarms for separate detection and recovery notifications."
+  event_pattern = jsonencode({
+    source        = ["aws.cloudwatch"]
+    "detail-type" = ["CloudWatch Alarm State Change"]
+    detail = {
+      state     = { value = ["ALARM", "OK"] }
+      alarmName = [{ wildcard = "${var.env_prefix}-*-Unhealthy-Target-INC-*" }]
+    }
+  })
+  tags = var.tags
+}
+
+resource "aws_sqs_queue" "alarm_state_event_dlq" {
+  name                      = "${var.env_prefix}-alarm-state-event-dlq"
+  message_retention_seconds = 1209600
+  sqs_managed_sse_enabled   = true
+  tags                      = var.tags
+}
+
+resource "aws_sqs_queue_policy" "alarm_state_event_dlq" {
+  queue_url = aws_sqs_queue.alarm_state_event_dlq.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "AllowEventBridgeSendToAlarmStateDLQ"
+      Effect    = "Allow"
+      Principal = { Service = "events.amazonaws.com" }
+      Action    = "sqs:SendMessage"
+      Resource  = aws_sqs_queue.alarm_state_event_dlq.arn
+      Condition = { ArnEquals = { "aws:SourceArn" = aws_cloudwatch_event_rule.target_incident_alarm_state.arn } }
+    }]
+  })
+}
+
+resource "aws_cloudwatch_event_target" "target_incident_alarm_state_router" {
+  rule      = aws_cloudwatch_event_rule.target_incident_alarm_state.name
+  target_id = "incident-event-router-alarm-state"
+  arn       = aws_lambda_function.incident_event_router.arn
+  retry_policy {
+    maximum_event_age_in_seconds = 86400
+    maximum_retry_attempts       = 12
+  }
+  dead_letter_config {
+    arn = aws_sqs_queue.alarm_state_event_dlq.arn
+  }
+  depends_on = [aws_sqs_queue_policy.alarm_state_event_dlq]
+}
+
+resource "aws_cloudwatch_metric_alarm" "alarm_state_event_dlq_not_empty" {
+  alarm_name          = "${var.env_prefix}-target-incident-alarm-dlq-not-empty"
+  alarm_description   = "One or more CloudWatch alarm-state events could not be delivered to the incident router. Inspect the DLQ before redriving messages."
+  namespace           = "AWS/SQS"
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  dimensions = {
+    QueueName = aws_sqs_queue.alarm_state_event_dlq.name
+  }
+  alarm_actions = [aws_sns_topic.cloudwatch_alarms_topic.arn]
+  tags          = var.tags
+}
+
+resource "aws_lambda_permission" "allow_eventbridge_alarm_state" {
+  statement_id  = "AllowEventBridgeTargetIncidentAlarmState"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.incident_event_router.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.target_incident_alarm_state.arn
 }
 resource "aws_cloudwatch_event_target" "asg_launch_lifecycle_router" {
   rule      = aws_cloudwatch_event_rule.asg_launch_success.name

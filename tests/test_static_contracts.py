@@ -25,13 +25,46 @@ class IncidentPipelineContractTests(unittest.TestCase):
         self.assertIn("notification_only", dispatcher)
         self.assertIn("Target-specific EventBridge events remain authoritative", dispatcher)
 
-    def test_detection_notification_precedes_worker_dispatch(self):
-        dispatcher = (ROOT / "modules/monitoring/dispatcher.py").read_text(encoding="utf-8")
+    def test_target_incident_notification_is_gated_by_cloudwatch_alarm_state(self):
         router = (ROOT / "modules/monitoring/event_router.py").read_text(encoding="utf-8")
-        dispatcher_handler = dispatcher[dispatcher.index("def lambda_handler(event, context):"):]
-        self.assertLess(dispatcher_handler.index("_send_incident_alert(item)"), dispatcher_handler.rindex("lam.invoke("))
+        pipeline = (ROOT / "modules/monitoring/production_pipeline.tf").read_text(encoding="utf-8")
         target_router = router[router.index("def _target_unhealthy(event):"):router.index("def lambda_handler(event, context):")]
-        self.assertLess(target_router.index("_send_detection_alert(item)"), target_router.index("LAM.invoke("))
+        alarm_handler = router[router.index("def _alarm_state_changed(event):"):router.index("def _target_unhealthy(event):")]
+        self.assertNotIn("_send_detection_alert(item)", target_router)
+        self.assertIn("_send_detection_alert(item)", alarm_handler)
+        self.assertIn('detail_type == "CloudWatch Alarm State Change"', router)
+        self.assertIn('"target_incident_alarm_state"', pipeline)
+        self.assertIn("dead_letter_config", pipeline)
+        self.assertIn("alarm_state_event_dlq_not_empty", pipeline)
+        self.assertIn("incident_alert_status = :delivered", alarm_handler)
+        self.assertIn("CloudWatch state:", router)
+
+    def test_alarm_recovery_and_verified_remediation_are_distinct_notifications(self):
+        router = (ROOT / "modules/monitoring/event_router.py").read_text(encoding="utf-8")
+        worker = (ROOT / "modules/monitoring/remediation_worker.py").read_text(encoding="utf-8")
+        pipeline = (ROOT / "modules/monitoring/production_pipeline.tf").read_text(encoding="utf-8")
+        self.assertIn("CloudWatch Alarm Recovered", router)
+        self.assertIn("ALARM → OK", router)
+        self.assertIn("Application recovery verification is pending", router)
+        self.assertIn('state     = { value = ["ALARM", "OK"] }', pipeline)
+        self.assertIn("Remediation Successful — Recovery Verified", router)
+        self.assertIn("APP_HEALTHCHECK_URL", worker)
+        self.assertIn("Remediation Verification Completed", worker)
+        self.assertIn("ROUTER_FUNCTION_NAME", pipeline)
+        self.assertIn('item.get("cloudwatch_alarm_state") == "OK"', router)
+        self.assertIn('item.get("alarm_recovery_notification_status") == "DELIVERED"', router)
+        self.assertIn('item.get("status") == "RECOVERY_VERIFIED"', router)
+        self.assertIn("verified_success_notification_status", router)
+        self.assertIn('item.get("target_health_check") == "PASSED"', router)
+        self.assertIn('item.get("application_health_check") == "PASSED"', router)
+        self.assertIn('item.get("capacity_check") == "PASSED"', router)
+        self.assertNotIn("Remediation Successful — Recovery Verified", worker)
+
+    def test_alarm_correlation_is_persisted_before_metric_publication(self):
+        router = (ROOT / "modules/monitoring/event_router.py").read_text(encoding="utf-8")
+        target_router = router[router.index("def _target_unhealthy(event):"):router.index("def lambda_handler(event, context):")]
+        self.assertLess(target_router.index('cloudwatch_alarm_name = :n'), target_router.index("_publish_instance_unhealthy_metric(dimensions, incident_id)"))
+        self.assertIn('alarm_name = f"{ENV_PREFIX}-{instance_id}-Unhealthy-Target-{incident_id}"', router)
 
     def test_asg_lifecycle_events_notify_slack_and_retry_failed_delivery(self):
         router = (ROOT / "modules/monitoring/event_router.py").read_text(encoding="utf-8")

@@ -45,10 +45,11 @@ After applying Terraform, verify:
 ## 6. If detection or replacement notifications are missing
 
 1. Check the CloudWatch alarm's `StateChangeTime`, `AlarmActions`, and whether the SNS topic delivered the message.
-2. Inspect `/aws/lambda/<env>-incident-dispatcher`. For an ALB alarm, expect a log similar to `ALB alarm notification delivered`; the dispatcher sends a notification-only fallback and must not invoke the remediation worker for that group-level alarm.
+2. Inspect `/aws/lambda/<env>-incident-dispatcher`. For a native ALB alarm, expect the notification-only fallback after the group-level alarm enters `ALARM`; it must not invoke the remediation worker.
+3. For target-specific incident ordering, inspect `/aws/lambda/<env>-incident-event-router`, the per-incident alarm history, and the `${ENV_PREFIX}-target-incident-alarm-state` EventBridge rule. The incident Slack alert is gated on the per-incident alarm's `ALARM` state. Failed deliveries should retry and eventually land in `${ENV_PREFIX}-alarm-state-event-dlq` if retries are exhausted.
 3. Inspect `/aws/lambda/<env>-incident-event-router`. Confirm the EventBridge target-health rule matched the event, the target ID was an EC2 instance ID, and the incident was written before the detection alert was attempted.
 4. For launch/termination notifications, inspect the lifecycle table item in `${ENV_PREFIX}-asg-lifecycle-events`. `notification_status=FAILED` and `notification_error` indicate a failed Slack request; the EventBridge target should retry the event.
-5. For final recovery, inspect `/aws/lambda/<env>-remediation-worker` and the incident's `recovery_status`, `replacement_instance_id`, `verification_result`, and `notification_status`.
+6. For final recovery, inspect `/aws/lambda/<env>-remediation-worker` and the incident's `recovery_status`, `replacement_instance_id`, `verification_result`, and `notification_status`.
 6. Confirm `SLACK_WEBHOOK_URL` is configured on dispatcher, event-router, and worker Lambda environments and that the webhook is valid. Do not paste the webhook into logs or issue reports.
 
 A launch notification means that Auto Scaling launched an instance; it is not a recovery success claim. Recovery is verified only when the worker confirms the replacement target is healthy and the capacity safeguards pass.
@@ -57,7 +58,14 @@ A launch notification means that Auto Scaling launched an instance; it is not a 
 ## Reviewing an unhealthy EC2 target in CloudWatch
 
 1. In the deployed region, open **CloudWatch → Alarms → All alarms** and search for `prod-ALB-Unhealthy-Targets` (or your environment prefix). This is the persistent target-group-level AWS/ApplicationELB alarm provisioned by Terraform.
-2. For the individual target incident, search for `<env>-<instance-id>-Unhealthy-Target-<suffix>`. These per-incident alarms use namespace `SelfHealing/TargetHealth`, metric `UnhealthyTargetDetected`, and dimensions `Environment`, `TargetGroupArn`, `InstanceId`, and `IncidentId`. They are created when the target-health EventBridge event reaches the incident router and are retained for review.
+2. For the individual target incident, search for `<env>-<instance-id>-Unhealthy-Target-INC-<24-hex-characters>`. These per-incident alarms use namespace `SelfHealing/TargetHealth`, metric `UnhealthyTargetDetected`, and dimensions `Environment`, `TargetGroupArn`, `InstanceId`, and `IncidentId`. They are created when the target-health EventBridge event reaches the incident router and are retained for review.
 3. Open the per-incident alarm and inspect **History** for its transition to `ALARM`; the matching event-router log entry and DynamoDB incident item contain the full event reason and incident context.
-4. The custom per-incident alarm has actions disabled intentionally. The EventBridge router sends the detection Slack message, while the alarm exists as a CloudWatch review surface. The native group alarm continues to publish its alarm-state notifications to SNS.
-5. If Slack arrives but no per-incident alarm exists, inspect `/aws/lambda/<env>-incident-event-router` for `CloudWatch per-instance alarm creation/publication failed`, then check the router role for `cloudwatch:PutMetricAlarm` and `cloudwatch:PutMetricData`. The incident record stores `cloudwatch_alarm_status` and, on failure, `cloudwatch_alarm_error`.
+4. The custom per-incident alarm has actions disabled intentionally. Its CloudWatch Alarm State Change event gates the detection Slack message. The native group alarm continues to publish its alarm-state notifications to SNS.
+5. If a lifecycle Slack update arrives before the incident alert, that is expected. If an incident alert is missing, inspect `/aws/lambda/<env>-incident-event-router`, the `${ENV_PREFIX}-target-incident-alarm-state` EventBridge rule, its `${ENV_PREFIX}-alarm-state-event-dlq`, and the incident record fields `cloudwatch_alarm_status`, `cloudwatch_alarm_state`, `incident_alert_status`, and `cloudwatch_alarm_error`. The router role needs `cloudwatch:PutMetricAlarm` and `cloudwatch:PutMetricData`.
+
+## Separate alarm-recovery and verified-remediation notifications
+
+1. The per-incident CloudWatch alarm transition `ALARM → OK` should produce a **CloudWatch Alarm Recovered** Slack message. It means only that the alarm condition cleared; the message explicitly says application verification is pending. Check `alarm_recovery_notification_status` and `alarm_recovered_at` in the incident item.
+2. The worker's **Remediation Successful — Recovery Verified** message is separate. It is emitted only if target health, application HTTP probe, and capacity checks all pass. Check `target_health_check`, `application_health_check`, `capacity_check`, their evidence fields, `replacement_instance_id`, and `recovery_status=RECOVERY_VERIFIED`.
+3. The application probe uses `APP_HEALTHCHECK_URL`, set by Terraform to the ALB HTTP URL. Confirm the app serves a successful 2xx response at `/`. If the app requires a different path or HTTPS, update the configured health URL accordingly. A missing or failed probe must not be represented as success.
+4. The group-level `${ENV_PREFIX}-ALB-Unhealthy-Targets` alarm does not identify a single target/incident; the incident-specific `...-Unhealthy-Target-INC-...` alarm is used for the correlated two-message sequence.

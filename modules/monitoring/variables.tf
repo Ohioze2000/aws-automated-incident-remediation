@@ -168,3 +168,12 @@ variable "min_healthy_targets" {
     error_message = "min_healthy_targets must be at least 1."
   }
 }
+
+variable "app_healthcheck_url" {
+  type        = string
+  description = "HTTP(S) URL used by the remediation worker to verify application-level health after target recovery."
+  validation {
+    condition     = can(regex("^https?://", var.app_healthcheck_url))
+    error_message = "app_healthcheck_url must be an HTTP or HTTPS URL."
+  }
+}

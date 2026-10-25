@@ -4,6 +4,7 @@ import logging
 import os
 import time
 import urllib.request
+import urllib.error
 from datetime import datetime, timezone, timedelta
 
 import boto3
@@ -18,8 +19,11 @@ TABLE = DDB.Table(os.environ["INCIDENT_TABLE_NAME"])
 LIFECYCLE = DDB.Table(os.environ["LIFECYCLE_TABLE_NAME"])
 ELB = boto3.client("elbv2", region_name=REGION)
 ASG = boto3.client("autoscaling", region_name=REGION)
+LAM = boto3.client("lambda", region_name=REGION)
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 TARGET_GROUP_ARN = os.environ.get("TARGET_GROUP_ARN", "")
+APP_HEALTHCHECK_URL = os.environ.get("APP_HEALTHCHECK_URL", "")
+ROUTER_FUNCTION_NAME = os.environ.get("ROUTER_FUNCTION_NAME", "")
 ASG_NAME = os.environ.get("ASG_NAME", "")
 MAX_ATTEMPTS = int(os.environ.get("MAX_REMEDIATION_ATTEMPTS", "1"))
 VERIFY_TIMEOUT = int(os.environ.get("VERIFICATION_TIMEOUT_SECONDS", "420"))
@@ -42,6 +46,7 @@ def _update(incident_id, status, **fields):
 
 
 def _slack(incident, status, detail, verification):
+    """Send non-success outcomes only; verified-success is CloudWatch-gated by event_router."""
     if not SLACK_WEBHOOK_URL:
         raise RuntimeError("SLACK_WEBHOOK_URL is not configured")
     text = (
@@ -51,6 +56,9 @@ def _slack(incident, status, detail, verification):
         f"*Signal:* `{incident.get('signal_type')}`\n"
         f"*Original instance:* `{incident.get('original_instance_id') or incident.get('instance_id') or 'unknown'}`\n"
         f"*Replacement instance:* `{incident.get('replacement_instance_id') or 'not confirmed'}`\n"
+        f"*Target health check:* `{incident.get('target_health_check', 'NOT_VERIFIED')}`\n"
+        f"*Application health check:* `{incident.get('application_health_check', 'NOT_VERIFIED')}`\n"
+        f"*Capacity check:* `{incident.get('capacity_check', 'NOT_VERIFIED')}`\n"
         f"*Remediation initiator:* `{incident.get('remediation_initiator', 'undetermined')}`\n"
         f"*Remediation outcome:* `{incident.get('remediation_outcome', status)}`\n"
         f"*Recovery status:* `{incident.get('recovery_status', status)}`\n"
@@ -79,6 +87,19 @@ def _target_counts():
     healthy = sum(1 for item in descriptions if item.get("TargetHealth", {}).get("State") == "healthy")
     unhealthy = [item.get("Target", {}).get("Id") for item in descriptions if item.get("TargetHealth", {}).get("State") == "unhealthy"]
     return healthy, [item for item in unhealthy if item]
+
+
+def _application_health():
+    """Perform a real HTTP probe; missing configuration is never reported as passed."""
+    if not APP_HEALTHCHECK_URL:
+        return False, "APP_HEALTHCHECK_URL is not configured"
+    request = urllib.request.Request(APP_HEALTHCHECK_URL, headers={"User-Agent": "aws-incident-remediation-verifier/1.0"}, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            passed = 200 <= response.status < 300
+            return passed, f"HTTP {response.status} from configured application health URL"
+    except Exception as exc:
+        return False, f"Application health probe failed: {type(exc).__name__}"
 
 
 def _asg_snapshot():
@@ -200,16 +221,26 @@ def _verify(incident, initial_status):
             healthy_replacements = sorted(candidate for candidate in candidates if _instance_health(candidate) == "healthy")
             if original_id not in current_ids and healthy_targets >= required_healthy and len(healthy_replacements) == 1:
                 replacement_id = healthy_replacements[0]
+                app_passed, app_evidence = _application_health()
                 incident["replacement_instance_id"] = replacement_id
-                incident["recovery_status"] = "RECOVERY_VERIFIED"
-                if terminations:
-                    incident["remediation_initiator"] = "autoscaling" if incident.get("remediation_initiator") != "worker" else "worker"
-                return "RECOVERY_VERIFIED", (
-                    f"Original instance {original_id} is absent; replacement {replacement_id} is healthy; "
-                    f"ALB reports {healthy_targets} healthy targets (required {required_healthy}); "
-                    f"ASG termination event {'observed' if terminations else 'not observed in lifecycle stream'}; "
-                    f"initiator={incident.get('remediation_initiator')}."
-                )
+                incident["target_health_check"] = "PASSED"
+                incident["target_health_evidence"] = f"Replacement {replacement_id} healthy; ALB healthy targets {healthy_targets}/{required_healthy}."
+                incident["capacity_check"] = "PASSED"
+                incident["capacity_evidence"] = f"ASG desired capacity={desired}; ALB healthy targets={healthy_targets}; required={required_healthy}; original instance absent."
+                incident["application_health_check"] = "PASSED" if app_passed else "FAILED"
+                incident["application_health_evidence"] = app_evidence
+                if app_passed:
+                    incident["recovery_status"] = "RECOVERY_VERIFIED"
+                    if terminations:
+                        incident["remediation_initiator"] = "autoscaling" if incident.get("remediation_initiator") != "worker" else "worker"
+                    return "RECOVERY_VERIFIED", (
+                        f"Original instance {original_id} is absent; replacement {replacement_id} is healthy; "
+                        f"ALB reports {healthy_targets} healthy targets (required {required_healthy}); "
+                        f"application probe passed ({app_evidence}); ASG termination event "
+                        f"{'observed' if terminations else 'not observed in lifecycle stream'}; "
+                        f"initiator={incident.get('remediation_initiator')}."
+                    )
+                last_evidence = f"Target and capacity checks passed, but application health failed: {app_evidence}"
             if len(healthy_replacements) > 1:
                 last_evidence = f"Original is absent={original_id not in current_ids}; multiple new healthy candidates={healthy_replacements}; refusing to guess replacement identity."
             else:
@@ -258,15 +289,38 @@ def lambda_handler(event, context):
             remediation_initiator=incident.get("remediation_initiator", "undetermined"),
             remediation_outcome=incident.get("remediation_outcome", action_status),
             recovery_status=incident.get("recovery_status", "NOT_APPLICABLE"),
+            target_health_check=incident.get("target_health_check", "NOT_VERIFIED"),
+            target_health_evidence=incident.get("target_health_evidence", "Not verified"),
+            application_health_check=incident.get("application_health_check", "NOT_VERIFIED"),
+            application_health_evidence=incident.get("application_health_evidence", "Not verified"),
+            capacity_check=incident.get("capacity_check", "NOT_VERIFIED"),
+            capacity_evidence=incident.get("capacity_evidence", "Not verified"),
             remediation_result=detail,
             verification_result=verification,
             completed_at=_now(),
         )
         try:
-            _slack(incident, final_status, detail, verification)
-            _update(incident_id, final_status, notification_status="DELIVERED")
+            if final_status == "RECOVERY_VERIFIED":
+                # Do not send success directly from the worker. The router releases it
+                # only after CloudWatch has emitted ALARM -> OK and the recovery alert
+                # is recorded as delivered. This also handles either event ordering.
+                if not ROUTER_FUNCTION_NAME:
+                    raise RuntimeError("ROUTER_FUNCTION_NAME is not configured")
+                LAM.invoke(
+                    FunctionName=ROUTER_FUNCTION_NAME,
+                    InvocationType="Event",
+                    Payload=json.dumps({
+                        "source": "aws.self-healing",
+                        "detail-type": "Remediation Verification Completed",
+                        "detail": {"incident_id": incident_id},
+                    }).encode("utf-8"),
+                )
+                _update(incident_id, final_status, notification_status="WAITING_FOR_CLOUDWATCH_OK")
+            else:
+                _slack(incident, final_status, detail, verification)
+                _update(incident_id, final_status, notification_status="DELIVERED")
         except Exception as notify_exc:
-            LOG.exception("Slack notification failed for incident %s", incident_id)
+            LOG.exception("Slack/notification handoff failed for incident %s", incident_id)
             _update(incident_id, final_status, notification_status="FAILED", notification_error=type(notify_exc).__name__)
         LOG.info("Incident completed incident_id=%s status=%s initiator=%s original=%s replacement=%s", incident_id, final_status, incident.get("remediation_initiator"), incident.get("original_instance_id"), incident.get("replacement_instance_id"))
         return {"status": final_status, "incident_id": incident_id}
