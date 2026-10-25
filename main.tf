@@ -146,7 +146,6 @@ module "webserver" {
   private_subnet_ids              = module.network.private_subnet_ids
   alb_security_group_id           = module.alb.alb_security_group_id
   target_group_arn                = module.alb.target_group_arn
-  app_healthcheck_url             = "http://${module.alb.alb_dns_name}/"
   iam_instance_profile_name       = module.iam.iam_instance_profile_name
   instance_type                   = var.instance_type
   image_name                      = var.image_name

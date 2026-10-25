@@ -31,13 +31,11 @@ variable "iam_instance_profile_name" {
 variable "image_name" {
   type        = string
   description = "AMI search pattern (e.g., ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*)"
-  default     = "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"
 }
 
 variable "instance_type" {
   type        = string
   description = "EC2 instance type for web server nodes"
-  default     = "t3.micro"
 }
 
 variable "public_key_content" {
@@ -61,19 +59,16 @@ variable "root_volume_size" {
 variable "desired_capacity" {
   type        = number
   description = "Target number of active instances in the ASG"
-  default     = 2
 }
 
 variable "min_size" {
   type        = number
   description = "Minimum number of instances in the ASG"
-  default     = 2
 }
 
 variable "max_size" {
   type        = number
   description = "Maximum number of instances in the ASG"
-  default     = 4
 }
 
 variable "tags" {

@@ -16,7 +16,6 @@ variable "vpc_cidr_block" {
 variable "az_count" {
   type        = number
   description = "Number of Availability Zones to deploy subnets into"
-  default     = 2
 }
 
 variable "my_ip" {
@@ -93,7 +92,6 @@ variable "slack_webhook_url" {
     error_message = "slack_webhook_url must be a Slack incoming webhook URL beginning with https://hooks.slack.com/."
   }
 }
-
 
 variable "alert_email" {
   type        = string
