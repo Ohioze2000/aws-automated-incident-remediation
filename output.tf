@@ -136,3 +136,8 @@ output "high_disk_alarm_arn" {
   description = "ARN of the high disk utilization alarm, or null if disabled"
   value       = module.monitoring.high_disk_alarm_arn
 }
+
+output "unhealthy_alb_alarm_name" {
+  description = "Name of the persistent target-group unhealthy alarm for console verification"
+  value       = "${var.env_prefix}-ALB-Unhealthy-Targets"
+}

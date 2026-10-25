@@ -40,3 +40,24 @@ After applying Terraform, verify:
 - The incident table TTL attribute matches the code's `ttl` field.
 - The worker failure DLQ is empty or every message is understood and resolved.
 - Test incidents in a non-production environment before enabling disruptive actions in production.
+
+
+## 6. If detection or replacement notifications are missing
+
+1. Check the CloudWatch alarm's `StateChangeTime`, `AlarmActions`, and whether the SNS topic delivered the message.
+2. Inspect `/aws/lambda/<env>-incident-dispatcher`. For an ALB alarm, expect a log similar to `ALB alarm notification delivered`; the dispatcher sends a notification-only fallback and must not invoke the remediation worker for that group-level alarm.
+3. Inspect `/aws/lambda/<env>-incident-event-router`. Confirm the EventBridge target-health rule matched the event, the target ID was an EC2 instance ID, and the incident was written before the detection alert was attempted.
+4. For launch/termination notifications, inspect the lifecycle table item in `${ENV_PREFIX}-asg-lifecycle-events`. `notification_status=FAILED` and `notification_error` indicate a failed Slack request; the EventBridge target should retry the event.
+5. For final recovery, inspect `/aws/lambda/<env>-remediation-worker` and the incident's `recovery_status`, `replacement_instance_id`, `verification_result`, and `notification_status`.
+6. Confirm `SLACK_WEBHOOK_URL` is configured on dispatcher, event-router, and worker Lambda environments and that the webhook is valid. Do not paste the webhook into logs or issue reports.
+
+A launch notification means that Auto Scaling launched an instance; it is not a recovery success claim. Recovery is verified only when the worker confirms the replacement target is healthy and the capacity safeguards pass.
+
+
+## Reviewing an unhealthy EC2 target in CloudWatch
+
+1. In the deployed region, open **CloudWatch → Alarms → All alarms** and search for `prod-ALB-Unhealthy-Targets` (or your environment prefix). This is the persistent target-group-level AWS/ApplicationELB alarm provisioned by Terraform.
+2. For the individual target incident, search for `<env>-<instance-id>-Unhealthy-Target-<suffix>`. These per-incident alarms use namespace `SelfHealing/TargetHealth`, metric `UnhealthyTargetDetected`, and dimensions `Environment`, `TargetGroupArn`, `InstanceId`, and `IncidentId`. They are created when the target-health EventBridge event reaches the incident router and are retained for review.
+3. Open the per-incident alarm and inspect **History** for its transition to `ALARM`; the matching event-router log entry and DynamoDB incident item contain the full event reason and incident context.
+4. The custom per-incident alarm has actions disabled intentionally. The EventBridge router sends the detection Slack message, while the alarm exists as a CloudWatch review surface. The native group alarm continues to publish its alarm-state notifications to SNS.
+5. If Slack arrives but no per-incident alarm exists, inspect `/aws/lambda/<env>-incident-event-router` for `CloudWatch per-instance alarm creation/publication failed`, then check the router role for `cloudwatch:PutMetricAlarm` and `cloudwatch:PutMetricData`. The incident record stores `cloudwatch_alarm_status` and, on failure, `cloudwatch_alarm_error`.

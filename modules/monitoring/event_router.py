@@ -15,6 +15,7 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 TABLE = boto3.resource("dynamodb", region_name=REGION).Table(os.environ["INCIDENT_TABLE_NAME"])
 LIFECYCLE = boto3.resource("dynamodb", region_name=REGION).Table(os.environ["LIFECYCLE_TABLE_NAME"])
 ASG = boto3.client("autoscaling", region_name=REGION)
+CW = boto3.client("cloudwatch", region_name=REGION)
 LAM = boto3.client("lambda", region_name=REGION)
 WORKER_ARN = os.environ["WORKER_FUNCTION_ARN"]
 ASG_NAME = os.environ["ASG_NAME"]
@@ -39,6 +40,7 @@ def _send_detection_alert(item):
         f"*Signal:* `{item['signal_type']}`\n"
         f"*Original instance:* `{item['original_instance_id']}`\n"
         f"*Target group:* `{item['target_group_arn']}`\n"
+        f"*CloudWatch alarm:* `{item.get('cloudwatch_alarm_name', 'creation pending; check incident record')}`\n"
         f"*Reason:* {item['reason']}\n"
         "*Status:* Target-specific incident persisted; safety evaluation and recovery verification are pending."
     )
@@ -161,6 +163,56 @@ def _write_lifecycle(event):
     return {"status": "recorded" if is_new else "retried", "event_type": event_type, "instance_id": instance_id}
 
 
+def _ensure_instance_unhealthy_alarm(instance_id, target_group_arn, incident_id, event_time, reason):
+    """Create a retained per-incident CloudWatch alarm and publish its trigger metric.
+
+    The native AWS/ApplicationELB alarm remains the target-group-level signal. This
+    custom alarm gives each target-specific EventBridge incident a reviewable alarm
+    name that includes the affected instance ID and a unique incident suffix.
+    Actions are disabled intentionally because this route already sends the direct
+    Slack detection alert; enabling SNS here would create a duplicate notification.
+    """
+    alarm_name = f"{ENV_PREFIX}-{instance_id}-Unhealthy-Target-{incident_id[-8:]}"
+    dimensions = [
+        {"Name": "Environment", "Value": ENV_PREFIX},
+        {"Name": "TargetGroupArn", "Value": target_group_arn},
+        {"Name": "InstanceId", "Value": instance_id},
+        {"Name": "IncidentId", "Value": incident_id},
+    ]
+    CW.put_metric_alarm(
+        AlarmName=alarm_name,
+        AlarmDescription=(
+            f"Target-specific unhealthy incident for instance {instance_id}; "
+            f"target group {target_group_arn}; incident {incident_id}; reason: {reason}. "
+            "Review the matching incident record and event-router logs."
+        )[:1024],
+        ActionsEnabled=False,
+        MetricName="UnhealthyTargetDetected",
+        Namespace="SelfHealing/TargetHealth",
+        Statistic="Sum",
+        Dimensions=dimensions,
+        Period=60,
+        EvaluationPeriods=1,
+        DatapointsToAlarm=1,
+        Threshold=1,
+        ComparisonOperator="GreaterThanOrEqualToThreshold",
+        TreatMissingData="notBreaching",
+    )
+    metric_timestamp = datetime.fromisoformat(event_time.replace("Z", "+00:00")).astimezone(timezone.utc)
+    CW.put_metric_data(
+        Namespace="SelfHealing/TargetHealth",
+        MetricData=[{
+            "MetricName": "UnhealthyTargetDetected",
+            "Dimensions": dimensions,
+            "Timestamp": metric_timestamp,
+            "Value": 1.0,
+            "Unit": "Count",
+        }],
+    )
+    LOG.info("Created and published CloudWatch target alarm=%s instance_id=%s incident_id=%s", alarm_name, instance_id, incident_id)
+    return alarm_name
+
+
 def _target_unhealthy(event):
     detail = event.get("detail", {})
     target_group_arn = detail.get("target-group-arn") or detail.get("targetGroupArn")
@@ -211,8 +263,22 @@ def _target_unhealthy(event):
             raise
         existing = TABLE.get_item(Key={"incident_id": incident_id}, ConsistentRead=True).get("Item", {})
         if existing.get("status") != "DISPATCH_FAILED":
-            LOG.info("Duplicate target-health event suppressed incident_id=%s status=%s", incident_id, existing.get("status", "missing"))
-            return {"status": "duplicate", "incident_id": incident_id}
+            # Retry only when the incident record shows alarm creation did not finish.
+            # A normal duplicate must not republish another custom-metric datapoint.
+            if existing.get("cloudwatch_alarm_status") == "ALARM_PUBLISHED":
+                LOG.info("Duplicate target-health event suppressed incident_id=%s status=%s", incident_id, existing.get("status", "missing"))
+                return {"status": "duplicate", "incident_id": incident_id, "cloudwatch_alarm_name": existing.get("cloudwatch_alarm_name", "")}
+            alarm_name = _ensure_instance_unhealthy_alarm(
+                instance_id, target_group_arn, incident_id, event_time,
+                f"ELB target became unhealthy: {reason}. {description}".strip(),
+            )
+            TABLE.update_item(
+                Key={"incident_id": incident_id},
+                UpdateExpression="SET cloudwatch_alarm_name = :n, cloudwatch_alarm_status = :s REMOVE cloudwatch_alarm_error",
+                ExpressionAttributeValues={":n": alarm_name, ":s": "ALARM_PUBLISHED"},
+            )
+            LOG.info("Duplicate target-health event reconciled CloudWatch alarm incident_id=%s", incident_id)
+            return {"status": "duplicate_alarm_reconciled", "incident_id": incident_id, "cloudwatch_alarm_name": alarm_name}
         try:
             TABLE.update_item(
                 Key={"incident_id": incident_id},
@@ -226,6 +292,29 @@ def _target_unhealthy(event):
             if claim_exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
                 return {"status": "duplicate", "incident_id": incident_id}
             raise
+
+    cloudwatch_alarm_error = None
+    try:
+        cloudwatch_alarm_name = _ensure_instance_unhealthy_alarm(
+            instance_id, target_group_arn, incident_id, event_time,
+            f"ELB target became unhealthy: {reason}. {description}".strip(),
+        )
+        item["cloudwatch_alarm_name"] = cloudwatch_alarm_name
+        item["cloudwatch_alarm_status"] = "ALARM_PUBLISHED"
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET cloudwatch_alarm_name = :n, cloudwatch_alarm_status = :s REMOVE cloudwatch_alarm_error",
+            ExpressionAttributeValues={":n": cloudwatch_alarm_name, ":s": "ALARM_PUBLISHED"},
+        )
+    except Exception as alarm_exc:
+        cloudwatch_alarm_error = alarm_exc
+        item["cloudwatch_alarm_status"] = "FAILED"
+        LOG.exception("CloudWatch per-instance alarm creation/publication failed incident_id=%s", incident_id)
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET cloudwatch_alarm_status = :s, cloudwatch_alarm_error = :e",
+            ExpressionAttributeValues={":s": "FAILED", ":e": type(alarm_exc).__name__},
+        )
 
     # Notify after persisting the incident but before worker dispatch. This way a
     # dispatch failure cannot suppress the detection message. On a retry, avoid
@@ -268,8 +357,13 @@ def _target_unhealthy(event):
             ExpressionAttributeValues={":s": "DISPATCH_FAILED", ":e": type(exc).__name__, ":t": datetime.now(timezone.utc).isoformat()},
         )
         raise
-    LOG.info("Target-health incident %s and dispatched incident_id=%s original_instance_id=%s", "retried" if is_retry else "persisted", incident_id, instance_id)
-    return {"status": "retried" if is_retry else "accepted", "incident_id": incident_id, "instance_id": instance_id}
+    if cloudwatch_alarm_error is not None:
+        # Slack and worker dispatch have already been attempted. Returning an error
+        # asks EventBridge to retry; the duplicate path retries only alarm creation
+        # and will not launch a second worker or resend a delivered detection alert.
+        raise RuntimeError("CloudWatch per-instance alarm creation failed; EventBridge retry requested") from cloudwatch_alarm_error
+    LOG.info("Target-health incident %s and dispatched incident_id=%s original_instance_id=%s cloudwatch_alarm=%s", "retried" if is_retry else "persisted", incident_id, instance_id, cloudwatch_alarm_name)
+    return {"status": "retried" if is_retry else "accepted", "incident_id": incident_id, "instance_id": instance_id, "cloudwatch_alarm_name": cloudwatch_alarm_name}
 
 
 def lambda_handler(event, context):

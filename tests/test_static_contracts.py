@@ -47,6 +47,35 @@ class IncidentPipelineContractTests(unittest.TestCase):
         self.assertIn("attribute_not_exists(incident_id)", source)
         self.assertIn("StateChangeTime", source)
 
+    def test_static_unhealthy_target_alarm_is_exported_and_checked_after_deploy(self):
+        root_outputs = (ROOT / "output.tf").read_text(encoding="utf-8")
+        workflow = (ROOT / ".github/workflows/aws-automated-incident-remediation.yml").read_text(encoding="utf-8")
+        monitoring = (ROOT / "modules/monitoring/main.tf").read_text(encoding="utf-8")
+        self.assertIn('output "unhealthy_alb_alarm_name"', root_outputs)
+        self.assertIn('${var.env_prefix}-ALB-Unhealthy-Targets', root_outputs)
+        self.assertIn('resource "aws_cloudwatch_metric_alarm" "unhealthy_alb_alarm"', monitoring)
+        self.assertIn("Verify CloudWatch unhealthy-target alarm exists", workflow)
+        self.assertIn("describe-alarms", workflow)
+        self.assertIn("AWS/ApplicationELB", workflow)
+        self.assertIn("UnHealthyHostCount", workflow)
+
+    def test_target_health_event_creates_reviewable_per_instance_cloudwatch_alarm(self):
+        router = (ROOT / "modules/monitoring/event_router.py").read_text(encoding="utf-8")
+        pipeline = (ROOT / "modules/monitoring/production_pipeline.tf").read_text(encoding="utf-8")
+        self.assertIn("def _ensure_instance_unhealthy_alarm(", router)
+        self.assertIn('Namespace="SelfHealing/TargetHealth"', router)
+        self.assertIn('MetricName="UnhealthyTargetDetected"', router)
+        self.assertIn('"Name": "InstanceId", "Value": instance_id', router)
+        self.assertIn('"Name": "IncidentId", "Value": incident_id', router)
+        self.assertIn("CW.put_metric_alarm(", router)
+        self.assertIn("CW.put_metric_data(", router)
+        self.assertIn('cloudwatch_alarm_status = :s', router)
+        self.assertIn('"cloudwatch:PutMetricAlarm"', pipeline)
+        self.assertIn('"cloudwatch:PutMetricData"', pipeline)
+        # The EventBridge path sends the detection Slack alert; the per-incident
+        # alarm is a review surface, not a second SNS notification source.
+        self.assertIn("ActionsEnabled=False", router)
+
     def test_target_health_event_carries_original_instance_into_dynamodb(self):
         router = (ROOT / "modules/monitoring/event_router.py").read_text(encoding="utf-8")
         terraform = (ROOT / "modules/monitoring/production_pipeline.tf").read_text(encoding="utf-8")

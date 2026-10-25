@@ -22,3 +22,13 @@ The application-error example is illustrative and is not enabled by default. Mat
 - Python source syntax compilation: passed.
 - `python -m unittest discover -s tests -v`: passed (15 tests).
 - Terraform CLI validation/formatting and live AWS integration tests: not run in this environment. Run `terraform fmt -check`, `terraform init -backend=false`, `terraform validate`, and a reviewed plan in a non-production workspace before applying.
+
+
+## Slack incident-notification reliability fixes
+
+- The SNS dispatcher no longer silently discards a CloudWatch ALB alarm. It writes a deduplicated `ALARM_NOTIFICATION_ONLY` record and sends a fallback Slack alert without invoking the worker; target-specific EventBridge events remain authoritative for ALB remediation.
+- The dispatcher now attempts the detection notification after persisting the incident and before worker invocation, so a failed asynchronous invoke does not suppress the initial alert. Duplicate SNS deliveries retry a missing/failed alert without starting another worker for an already active/completed incident.
+- The EventBridge target-health router now attempts its instance-specific detection alert before invoking the worker and skips a duplicate alert when a retry finds delivery already recorded.
+- ASG launch/termination lifecycle events now send Slack operational notifications. Launch messages identify the new instance but explicitly state that launch is not proof of recovery; only the worker's verified outcome may claim recovery.
+- Lifecycle notification status is stored in the lifecycle table. Failed sends raise after recording failure so EventBridge can retry. Added the corresponding DynamoDB `GetItem`/`UpdateItem` permissions and tests.
+
