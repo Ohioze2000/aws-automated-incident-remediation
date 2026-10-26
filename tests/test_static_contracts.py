@@ -18,12 +18,10 @@ class IncidentPipelineContractTests(unittest.TestCase):
         ):
             ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
 
-    def test_alb_cloudwatch_alarm_has_notification_fallback_without_worker_dispatch(self):
+    def test_alb_sns_path_does_not_send_slack(self):
         dispatcher = (ROOT / "modules/monitoring/dispatcher.py").read_text(encoding="utf-8")
-        self.assertIn("_handle_alb_alarm_notification(alarm_name, alarm_arn, state_time, message)", dispatcher)
-        self.assertIn('"ALARM_NOTIFICATION_ONLY"', dispatcher)
-        self.assertIn("notification_only", dispatcher)
-        self.assertIn("Target-specific EventBridge events remain authoritative", dispatcher)
+        self.assertIn("Slack notification is owned by CloudWatch EventBridge route", dispatcher)
+        self.assertNotIn("_handle_alb_alarm_notification", dispatcher)
 
     def test_target_incident_notification_is_gated_by_cloudwatch_alarm_state(self):
         router = (ROOT / "modules/monitoring/event_router.py").read_text(encoding="utf-8")
@@ -66,14 +64,17 @@ class IncidentPipelineContractTests(unittest.TestCase):
         self.assertLess(target_router.index('cloudwatch_alarm_name = :n'), target_router.index("_publish_instance_unhealthy_metric(dimensions, incident_id)"))
         self.assertIn('alarm_name = f"{ENV_PREFIX}-{instance_id}-Unhealthy-Target-{incident_id}"', router)
 
-    def test_asg_lifecycle_events_notify_slack_and_retry_failed_delivery(self):
+    def test_asg_lifecycle_notifications_are_gated_by_cloudwatch_alarm_state(self):
         router = (ROOT / "modules/monitoring/event_router.py").read_text(encoding="utf-8")
         pipeline = (ROOT / "modules/monitoring/production_pipeline.tf").read_text(encoding="utf-8")
+        lifecycle = router[router.index("def _write_lifecycle(event):"):router.index("def _ensure_instance_unhealthy_alarm(")]
         self.assertIn("def _send_lifecycle_alert(item):", router)
         self.assertIn("AWS Auto Scaling Instance Launch Completed", router)
-        self.assertIn('notification_status = :s', router)
-        self.assertIn('"dynamodb:GetItem", "dynamodb:UpdateItem"', pipeline)
-        self.assertIn("raise", router[router.index("def _write_lifecycle(event):"):router.index("def _target_unhealthy(event):")])
+        self.assertIn("CW.put_metric_alarm(", lifecycle)
+        self.assertIn("CW.put_metric_data(", lifecycle)
+        self.assertNotIn("_send_lifecycle_alert(item)", lifecycle)
+        self.assertIn('alarmName = [{ wildcard = "${var.env_prefix}-*" }]', pipeline)
+        self.assertIn("lifecycle_alarm_state_changed", router)
 
     def test_dynamodb_idempotency_is_present(self):
         source = (ROOT / "modules/monitoring/dispatcher.py").read_text(encoding="utf-8")
@@ -118,11 +119,18 @@ class IncidentPipelineContractTests(unittest.TestCase):
         self.assertIn('"target-health"    = { state = ["unhealthy"] }', terraform)
         self.assertIn('"${var.env_prefix}-asg-lifecycle-events"', terraform)
 
-    def test_alb_alarm_does_not_create_duplicate_group_scoped_incident(self):
+    def test_sns_dispatcher_never_sends_slack_directly(self):
         dispatcher = (ROOT / "modules/monitoring/dispatcher.py").read_text(encoding="utf-8")
-        self.assertIn('if _signal(alarm_name) == "alb_health":', dispatcher)
-        self.assertIn("_handle_alb_alarm_notification(alarm_name, alarm_arn, state_time, message)", dispatcher)
-        self.assertIn("Target-specific EventBridge events remain authoritative", dispatcher)
+        self.assertNotIn("_send_incident_alert", dispatcher)
+        self.assertNotIn("urllib.request", dispatcher)
+        self.assertIn("Slack notification is owned by CloudWatch EventBridge route", dispatcher)
+
+    def test_all_alarm_transitions_route_through_cloudwatch_eventbridge(self):
+        pipeline = (ROOT / "modules/monitoring/production_pipeline.tf").read_text(encoding="utf-8")
+        router = (ROOT / "modules/monitoring/event_router.py").read_text(encoding="utf-8")
+        self.assertIn('alarmName = [{ wildcard = "${var.env_prefix}-*" }]', pipeline)
+        self.assertIn("_general_alarm_state_changed(event, state, state_at, alarm_name)", router)
+        self.assertIn("ALARM → OK", router)
 
     def test_worker_correlates_native_asg_replacement_and_verifies_replacement_target(self):
         worker = (ROOT / "modules/monitoring/remediation_worker.py").read_text(encoding="utf-8")
@@ -161,7 +169,8 @@ class IncidentPipelineContractTests(unittest.TestCase):
         dispatcher = (ROOT / "modules/monitoring/dispatcher.py").read_text(encoding="utf-8")
         terraform = (ROOT / "modules/monitoring/production_pipeline.tf").read_text(encoding="utf-8")
         self.assertIn('os.environ.get("SLACK_WEBHOOK_URL", "")', worker)
-        self.assertIn('os.environ.get("SLACK_WEBHOOK_URL", "")', dispatcher)
+        self.assertNotIn('os.environ.get("SLACK_WEBHOOK_URL", "")', dispatcher)
+        self.assertIn('os.environ.get("SLACK_WEBHOOK_URL", "")', (ROOT / "modules/monitoring/event_router.py").read_text(encoding="utf-8"))
         self.assertIn("SLACK_WEBHOOK_URL", terraform)
         self.assertNotIn("secretsmanager:GetSecretValue", terraform)
         self.assertNotIn("SLACK_WEBHOOK_SECRET_ARN", worker + dispatcher + terraform)
@@ -175,13 +184,13 @@ class IncidentPipelineContractTests(unittest.TestCase):
     def test_harmonized_application_metric_filters_and_alarms(self):
         root_variables = (ROOT / "variables.tf").read_text(encoding="utf-8")
         logging_variables = (ROOT / "modules/logging/variables.tf").read_text(encoding="utf-8")
-        for signal in ("ApplicationErrors", "HTTP5xxCount", "DBConnectionTimeoutCount"):
-            self.assertIn(signal, root_variables)
-        self.assertIn('log_group_key    = "web_app"', root_variables)
-        self.assertIn('log_group_key    = "nginx/access"', root_variables)
+        self.assertIn('metric_name      = string', root_variables)
+        self.assertIn('metric_namespace = string', root_variables)
+        self.assertIn('log_group_key    = string', root_variables)
         self.assertIn('default_value = optional(number)', root_variables)
         self.assertIn('default_value    = optional(number)', logging_variables)
-        self.assertIn('metric_namespace = "CustomAppMetrics"', root_variables)
+        self.assertIn('for_each = var.metric_filters', (ROOT / "modules/logging/main.tf").read_text(encoding="utf-8"))
+        self.assertIn('for_each = var.app_alarms', (ROOT / "modules/logging/main.tf").read_text(encoding="utf-8"))
 
     def test_logging_module_is_single_owner(self):
         root_main = (ROOT / "main.tf").read_text(encoding="utf-8")

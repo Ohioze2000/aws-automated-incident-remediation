@@ -26,9 +26,8 @@ The application-error example is illustrative and is not enabled by default. Mat
 
 ## Slack incident-notification reliability fixes
 
-- The SNS dispatcher no longer silently discards a CloudWatch ALB alarm. It writes a deduplicated `ALARM_NOTIFICATION_ONLY` record and sends a fallback Slack alert without invoking the worker; target-specific EventBridge events remain authoritative for ALB remediation.
-- The dispatcher now attempts the detection notification after persisting the incident and before worker invocation, so a failed asynchronous invoke does not suppress the initial alert. Duplicate SNS deliveries retry a missing/failed alert without starting another worker for an already active/completed incident.
-- The EventBridge target-health router now attempts its instance-specific detection alert before invoking the worker and skips a duplicate alert when a retry finds delivery already recorded.
-- ASG launch/termination lifecycle events now send Slack operational notifications. Launch messages identify the new instance but explicitly state that launch is not proof of recovery; only the worker's verified outcome may claim recovery.
-- Lifecycle notification status is stored in the lifecycle table. Failed sends raise after recording failure so EventBridge can retry. Added the corresponding DynamoDB `GetItem`/`UpdateItem` permissions and tests.
+- The SNS dispatcher persists/deduplicates incidents and invokes the remediation worker only; it does not send Slack. The CloudWatch Alarm State Change EventBridge route owns incident ALARM and OK Slack messages.
+- The target-health router creates the per-instance CloudWatch alarm and persists its incident correlation before publishing the metric. Detection Slack is emitted only after the matching CloudWatch alarm enters ALARM.
+- ASG launch/termination events are persisted and converted into deterministic one-shot CloudWatch alarms. The lifecycle handler does not send Slack directly; the corresponding CloudWatch ALARM state-change event gates the operational Slack notification.
+- The CloudWatch alarm-state EventBridge rule now covers all environment-prefixed alarms and has retry/DLQ handling. Recovery notifications remain separate from verified-remediation-success notifications.
 

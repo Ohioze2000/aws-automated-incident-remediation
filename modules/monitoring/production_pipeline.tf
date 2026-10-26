@@ -176,7 +176,6 @@ resource "aws_lambda_function" "incident_dispatcher" {
       WORKER_FUNCTION_ARN = aws_lambda_function.remediation_worker.arn
       ENV_PREFIX          = var.env_prefix
       INCIDENT_TTL_DAYS   = tostring(var.incident_ttl_days)
-      SLACK_WEBHOOK_URL   = var.slack_webhook_url
     }
   }
   depends_on = [aws_cloudwatch_log_group.dispatcher_logs]
@@ -280,17 +279,17 @@ resource "aws_lambda_permission" "allow_eventbridge_target_health" {
   source_arn    = aws_cloudwatch_event_rule.elb_target_health_unhealthy.arn
 }
 
-# Only the per-incident target alarm state transition may release the incident-detection
-# Slack notification. Lifecycle messages remain immediate and independent.
+# All environment alarm notifications are released only by CloudWatch state-change events.
+# SNS is retained for incident dispatch; it is not a Slack notification path.
 resource "aws_cloudwatch_event_rule" "target_incident_alarm_state" {
-  name        = "${var.env_prefix}-target-incident-alarm-state"
-  description = "Route ALARM and OK transitions for target-specific incident alarms for separate detection and recovery notifications."
+  name        = "${var.env_prefix}-cloudwatch-alarm-state-notifications"
+  description = "Route ALARM and OK transitions for all environment alarms after CloudWatch records the state change."
   event_pattern = jsonencode({
     source        = ["aws.cloudwatch"]
     "detail-type" = ["CloudWatch Alarm State Change"]
     detail = {
       state     = { value = ["ALARM", "OK"] }
-      alarmName = [{ wildcard = "${var.env_prefix}-*-Unhealthy-Target-INC-*" }]
+      alarmName = [{ wildcard = "${var.env_prefix}-*" }]
     }
   })
   tags = var.tags

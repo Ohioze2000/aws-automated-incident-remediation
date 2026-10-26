@@ -1,11 +1,25 @@
-# CloudWatch-gated Slack notification sequence
+# CloudWatch-gated notification flow
 
-For correlated per-incident ALB target-health incidents, incident lifecycle Slack messages follow this sequence:
+## Incident alarms (CPU, memory, disk, ALB, application errors)
 
-1. **Incident detected:** the event router sends the detection Slack message only after the incident-specific CloudWatch alarm emits an `ALARM` state-change event.
-2. **CloudWatch alarm recovered:** the event router sends a distinct `ALARM → OK` message only after CloudWatch emits the correlated alarm's `OK` state-change event. The text explicitly says application verification is pending.
-3. **Remediation successful — recovery verified:** the worker records its verification evidence and sends an internal completion event to the router. The router sends the success Slack message only when the DynamoDB incident record confirms all of the following: CloudWatch alarm state is `OK`, the recovery notification was delivered, incident status is `RECOVERY_VERIFIED`, target health passed, application HTTP probe passed, capacity passed, and a replacement instance ID is present.
+1. CloudWatch evaluates the configured metric alarm and records a state transition (`ALARM` or `OK`).
+2. CloudWatch emits `CloudWatch Alarm State Change` to EventBridge. The environment-prefixed alarm rule routes the event to the incident event router.
+3. The router correlates and deduplicates the state transition in DynamoDB, then sends the corresponding Slack message. An `OK` notification is not sent until the prior `ALARM` notification has been delivered.
+4. In parallel, SNS invokes the dispatcher for alarm notifications that have SNS actions. The dispatcher persists/deduplicates incidents and invokes the remediation worker; it does not send Slack.
+5. A remediation-success Slack message is separate and is sent only after CloudWatch `OK` plus all configured recovery checks pass.
 
-The worker cannot send the verified-success Slack message directly. If verification completes before CloudWatch reaches `OK`, the success notification is deferred. If CloudWatch reaches `OK` first, the later worker completion event releases the success notification. DynamoDB notification status fields suppress duplicate success messages and preserve retryability.
+## Target-specific unhealthy events
 
-This sequence is implemented for the correlated per-incident target-health alarms named with `-Unhealthy-Target-INC-...`. The group-level ALB alarm remains notification-only. This is source-level behavior; validate Terraform and the full sequence in AWS before treating it as production-validated. EventBridge and Lambda are at-least-once systems, and Slack webhooks cannot provide a strict exactly-once guarantee if Slack accepts a message but the delivery-status write fails.
+1. EventBridge receives the ELB target-health event and the router persists the incident and original instance ID.
+2. The router creates a per-incident CloudWatch alarm, persists the alarm-to-incident correlation, and publishes the custom metric.
+3. Only the subsequent CloudWatch alarm-state event releases the incident-detection Slack notification. The per-incident alarm has alarm actions disabled to prevent a duplicate SNS path.
+
+## Auto Scaling lifecycle events
+
+1. EventBridge receives the ASG lifecycle event. The router persists it in the lifecycle table and a `LIFECYCLE-*` incident record.
+2. The router creates a deterministic one-shot CloudWatch alarm and publishes a lifecycle metric. It does not send Slack at this stage.
+3. After CloudWatch enters `ALARM`, the alarm-state event route sends the launch/termination operational message to Slack. A successful launch does not mean the application has recovered.
+
+## Ordering guarantee and limits
+
+Slack incident/recovery/lifecycle messages are triggered from CloudWatch Alarm State Change events, not directly from the original ELB/ASG event or SNS dispatcher. This means CloudWatch must first evaluate and record the relevant alarm transition. EventBridge delivery is at-least-once; DynamoDB idempotency suppresses duplicate state events, but Slack webhooks cannot provide strict exactly-once delivery if a process crashes after Slack accepts a message and before DynamoDB records success. The repository must still pass Terraform validation and live AWS integration tests after deployment.

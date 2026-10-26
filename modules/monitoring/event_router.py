@@ -53,7 +53,7 @@ def _send_detection_alert(item):
 
 
 def _send_lifecycle_alert(item):
-    """Notify on ASG lifecycle changes without claiming that launch equals recovery."""
+    """Notify only after the lifecycle event's CloudWatch alarm entered ALARM."""
     if not SLACK_WEBHOOK_URL:
         raise RuntimeError("SLACK_WEBHOOK_URL is not configured")
     event_type = item.get("event_type", "ASG lifecycle event")
@@ -61,24 +61,26 @@ def _send_lifecycle_alert(item):
     if "Launch Successful" in event_type:
         headline = "AWS Auto Scaling Instance Launch Completed"
         meaning = (
-            "A new instance has launched. It may be the replacement for an unhealthy instance, "
-            "but recovery is not confirmed until the target is healthy and capacity checks pass."
+            "CloudWatch confirmed the launch-completed event. The instance may be a replacement, "
+            "but this event alone does not prove service recovery; target, application, and capacity checks remain authoritative."
         )
     elif "Terminate Successful" in event_type:
         headline = "AWS Auto Scaling Instance Termination Completed"
-        meaning = "The instance termination completed; this event alone does not prove service recovery."
+        meaning = "CloudWatch confirmed the termination-completed event; this does not by itself prove service recovery."
     elif "Unsuccessful" in event_type:
         headline = "AWS Auto Scaling Lifecycle Operation Failed"
-        meaning = "Auto Scaling reported an unsuccessful lifecycle operation. Investigate the ASG activity history."
+        meaning = "CloudWatch confirmed the lifecycle-failure event. Investigate the ASG activity history."
     else:
         headline = "AWS Auto Scaling Lifecycle Event"
-        meaning = "Review the ASG lifecycle event and incident evidence."
+        meaning = "CloudWatch confirmed the lifecycle event; review the incident evidence."
     message = (
         f"*{headline}*\n"
         f"*Environment:* `{ENV_PREFIX}`\n"
         f"*Auto Scaling Group:* `{item.get('asg_name', ASG_NAME)}`\n"
         f"*Event:* `{event_type}`\n"
         f"*Instance:* `{instance_id}`\n"
+        f"*CloudWatch alarm:* `{item.get('cloudwatch_alarm_name', 'unknown')}`\n"
+        f"*CloudWatch state:* `ALARM` confirmed at `{item.get('cloudwatch_alarm_state_at', 'unknown')}`\n"
         f"*Event time:* `{item.get('event_time', 'unknown')}`\n"
         f"*Region:* `{REGION}`\n"
         f"*Interpretation:* {meaning}"
@@ -94,6 +96,37 @@ def _send_lifecycle_alert(item):
             raise RuntimeError(f"Slack webhook returned HTTP {response.status}")
 
 
+def _send_general_alarm_alert(item, state, state_at, reason):
+    """Deliver ALARM/OK messages only from a CloudWatch Alarm State Change event."""
+    if not SLACK_WEBHOOK_URL:
+        raise RuntimeError("SLACK_WEBHOOK_URL is not configured")
+    signal = item.get("signal_type", "unknown")
+    if state == "ALARM":
+        headline = "AWS Self-Healing Incident Detected"
+        status = "CloudWatch has entered ALARM. Remediation and recovery verification are separate and remain pending."
+    else:
+        headline = "AWS CloudWatch Alarm Recovered"
+        status = "CloudWatch has confirmed ALARM → OK. Application, target-health, and capacity verification may still be pending."
+    message = (
+        f"*{headline}*\n"
+        f"*Incident:* `{item['incident_id']}`\n"
+        f"*Environment:* `{ENV_PREFIX}`\n"
+        f"*Signal:* `{signal}`\n"
+        f"*Alarm:* `{item.get('cloudwatch_alarm_name', item.get('alarm_name', 'unknown'))}`\n"
+        f"*Resource:* `{item.get('instance_id') or 'not instance-scoped'}`\n"
+        f"*CloudWatch state:* `{state}` confirmed at `{state_at}`\n"
+        f"*Reason:* {reason or 'No state-change reason supplied.'}\n"
+        f"*Status:* {status}"
+    )
+    request = urllib.request.Request(
+        SLACK_WEBHOOK_URL, data=json.dumps({"text": message}).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        if response.status < 200 or response.status >= 300:
+            raise RuntimeError(f"Slack webhook returned HTTP {response.status}")
+
+
 def _asg_snapshot_ids():
     response = ASG.describe_auto_scaling_groups(AutoScalingGroupNames=[ASG_NAME])
     groups = response.get("AutoScalingGroups", [])
@@ -103,6 +136,11 @@ def _asg_snapshot_ids():
 
 
 def _write_lifecycle(event):
+    """Persist ASG lifecycle evidence, then create/publish a CloudWatch alarm signal.
+
+    This function deliberately does not send Slack. Slack is sent only by
+    _alarm_state_changed after CloudWatch emits the corresponding ALARM transition.
+    """
     detail = event.get("detail", {})
     event_type = event.get("detail-type", "unknown")
     group = detail.get("AutoScalingGroupName")
@@ -110,59 +148,99 @@ def _write_lifecycle(event):
     if group != ASG_NAME or not instance_id:
         LOG.info("Ignoring unrelated/incomplete ASG lifecycle event type=%s group=%s", event_type, group)
         return {"status": "ignored"}
+
     event_time = _iso(event.get("time"))
     event_id = event.get("id", "no-event-id")
     event_key = f"{event_time}#{event_id}"
+    lifecycle_id = "LIFECYCLE-" + hashlib.sha256(f"{group}|{event_id}".encode()).hexdigest()[:24].upper()
+    alarm_name = f"{ENV_PREFIX}-Lifecycle-{lifecycle_id}"
     ttl = int(datetime.now(timezone.utc).timestamp()) + TTL_DAYS * 86400
-    item = {
-        "asg_name": group,
-        "event_key": event_key,
-        "event_time": event_time,
-        "event_id": event_id,
-        "event_type": event_type,
-        "instance_id": instance_id,
+    lifecycle_item = {
+        "asg_name": group, "event_key": event_key, "event_time": event_time,
+        "event_id": event_id, "event_type": event_type, "instance_id": instance_id,
         "detail": json.dumps(detail, separators=(",", ":"))[:3000],
-        "notification_status": "PENDING",
-        "ttl": ttl,
+        "cloudwatch_alarm_name": alarm_name, "cloudwatch_alarm_status": "PENDING",
+        "notification_status": "WAITING_FOR_CLOUDWATCH", "ttl": ttl,
     }
-    is_new = True
     try:
-        LIFECYCLE.put_item(Item=item, ConditionExpression="attribute_not_exists(event_key)")
+        LIFECYCLE.put_item(Item=lifecycle_item, ConditionExpression="attribute_not_exists(event_key)")
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
             raise
-        is_new = False
-        existing = LIFECYCLE.get_item(
-            Key={"asg_name": group, "event_key": event_key}, ConsistentRead=True
-        ).get("Item", {})
-        if existing.get("notification_status") == "DELIVERED":
-            LOG.info("Duplicate ASG lifecycle event suppressed event_key=%s", event_key)
+        existing = LIFECYCLE.get_item(Key={"asg_name": group, "event_key": event_key}, ConsistentRead=True).get("Item", {})
+        if existing.get("cloudwatch_alarm_status") == "ALARM_PUBLISHED":
+            LOG.info("Duplicate lifecycle event suppressed event_key=%s", event_key)
             return {"status": "duplicate", "event_type": event_type, "instance_id": instance_id}
-        item = existing or item
+        lifecycle_item = existing or lifecycle_item
+        alarm_name = lifecycle_item.get("cloudwatch_alarm_name", alarm_name)
 
-    # Lifecycle messages are operational evidence, not a claim of successful recovery.
-    # If Slack fails, mark the record and raise so EventBridge can retry delivery.
+    incident_item = {
+        "incident_id": lifecycle_id, "signal_type": "asg_lifecycle", "event_type": event_type,
+        "asg_name": group, "instance_id": instance_id, "event_time": event_time,
+        "environment": ENV_PREFIX, "cloudwatch_alarm_name": alarm_name,
+        "cloudwatch_alarm_status": "ALARM_CREATED", "cloudwatch_alarm_state": "INSUFFICIENT_DATA",
+        "reason": f"Auto Scaling emitted {event_type} for instance {instance_id}.",
+        "status": "LIFECYCLE_EVENT", "created_at": datetime.now(timezone.utc).isoformat(), "ttl": ttl,
+    }
     try:
-        _send_lifecycle_alert(item)
-        LIFECYCLE.update_item(
-            Key={"asg_name": group, "event_key": event_key},
-            UpdateExpression="SET notification_status = :s, notification_sent_at = :t",
-            ExpressionAttributeValues={":s": "DELIVERED", ":t": datetime.now(timezone.utc).isoformat()},
+        TABLE.put_item(Item=incident_item, ConditionExpression="attribute_not_exists(incident_id)")
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+        existing_incident = TABLE.get_item(Key={"incident_id": lifecycle_id}, ConsistentRead=True).get("Item", {})
+        if existing_incident.get("cloudwatch_alarm_status") == "ALARM_PUBLISHED":
+            LOG.info("Lifecycle incident already published to CloudWatch incident_id=%s", lifecycle_id)
+            return {"status": "duplicate", "event_type": event_type, "instance_id": instance_id}
+        # Resume a prior partial attempt. The deterministic alarm name and metric
+        # dimensions make PutMetricAlarm safe to repeat.
+        incident_item = existing_incident or incident_item
+    metric_dimensions = [
+        {"Name": "EventId", "Value": lifecycle_id},
+        {"Name": "EventType", "Value": event_type[:255]},
+    ]
+    try:
+        CW.put_metric_alarm(
+            AlarmName=alarm_name,
+            AlarmDescription=f"CloudWatch-gated notification for ASG lifecycle event {lifecycle_id} ({event_type}) for {instance_id}.",
+            ActionsEnabled=False,
+            MetricName="LifecycleEvent",
+            Namespace="SelfHealing/ASGLifecycle",
+            Statistic="Sum", Dimensions=metric_dimensions,
+            Period=60, EvaluationPeriods=1, DatapointsToAlarm=1,
+            Threshold=1, ComparisonOperator="GreaterThanOrEqualToThreshold",
+            TreatMissingData="notBreaching",
         )
-    except Exception as notify_exc:
-        LOG.exception("ASG lifecycle Slack alert failed event_key=%s", event_key)
         LIFECYCLE.update_item(
             Key={"asg_name": group, "event_key": event_key},
-            UpdateExpression="SET notification_status = :s, notification_error = :e",
-            ExpressionAttributeValues={":s": "FAILED", ":e": type(notify_exc).__name__},
+            UpdateExpression="SET cloudwatch_alarm_status = :s",
+            ExpressionAttributeValues={":s": "ALARM_CREATED"},
+        )
+        CW.put_metric_data(
+            Namespace="SelfHealing/ASGLifecycle",
+            MetricData=[{"MetricName": "LifecycleEvent", "Dimensions": metric_dimensions,
+                         "Timestamp": datetime.now(timezone.utc), "Value": 1.0, "Unit": "Count"}],
+        )
+        TABLE.update_item(
+            Key={"incident_id": lifecycle_id},
+            UpdateExpression="SET cloudwatch_alarm_status = :s",
+            ExpressionAttributeValues={":s": "ALARM_PUBLISHED"},
+        )
+        LIFECYCLE.update_item(
+            Key={"asg_name": group, "event_key": event_key},
+            UpdateExpression="SET cloudwatch_alarm_status = :s, notification_status = :n",
+            ExpressionAttributeValues={":s": "ALARM_PUBLISHED", ":n": "WAITING_FOR_CLOUDWATCH"},
+        )
+    except Exception as exc:
+        LOG.exception("Failed to publish CloudWatch lifecycle alarm event_id=%s", event_id)
+        TABLE.update_item(
+            Key={"incident_id": lifecycle_id},
+            UpdateExpression="SET cloudwatch_alarm_status = :s, cloudwatch_alarm_error = :e",
+            ExpressionAttributeValues={":s": "FAILED", ":e": type(exc).__name__},
         )
         raise
 
-    LOG.info(
-        "Recorded ASG lifecycle event type=%s instance_id=%s event_time=%s new=%s",
-        event_type, instance_id, event_time, is_new,
-    )
-    return {"status": "recorded" if is_new else "retried", "event_type": event_type, "instance_id": instance_id}
+    LOG.info("Lifecycle event persisted and published to CloudWatch alarm=%s event_id=%s", alarm_name, event_id)
+    return {"status": "cloudwatch_alarm_published", "event_type": event_type, "instance_id": instance_id, "cloudwatch_alarm_name": alarm_name}
 
 
 def _ensure_instance_unhealthy_alarm(instance_id, target_group_arn, incident_id, event_time, reason):
@@ -327,18 +405,136 @@ def _maybe_send_verified_success(incident_id):
         raise
     return {"status": "verified_success_notified", "incident_id": incident_id}
 
+def _lifecycle_alarm_state_changed(event, incident_id, state, state_at, alarm_name):
+    item = TABLE.get_item(Key={"incident_id": incident_id}, ConsistentRead=True).get("Item")
+    if not item:
+        raise RuntimeError(f"No lifecycle record found for CloudWatch alarm {alarm_name}")
+    if state != "ALARM":
+        # Lifecycle events are one-shot facts. Their alarm is intentionally not
+        # reset, so an unexpected OK transition is logged but not misreported as recovery.
+        LOG.info("Ignoring OK transition for one-shot lifecycle alarm=%s", alarm_name)
+        return {"status": "lifecycle_ok_ignored", "incident_id": incident_id}
+    if item.get("incident_alert_status") == "DELIVERED":
+        return {"status": "already_notified", "incident_id": incident_id}
+    try:
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET incident_alert_status = :claimed, cloudwatch_alarm_state = :state, cloudwatch_alarm_state_at = :at, cloudwatch_alarm_name = :alarm",
+            ConditionExpression="attribute_not_exists(incident_alert_status) OR incident_alert_status = :failed",
+            ExpressionAttributeValues={":claimed": "CLAIMED", ":failed": "FAILED", ":state": "ALARM", ":at": state_at, ":alarm": alarm_name},
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            latest = TABLE.get_item(Key={"incident_id": incident_id}, ConsistentRead=True).get("Item", {})
+            if latest.get("incident_alert_status") == "DELIVERED":
+                return {"status": "already_notified", "incident_id": incident_id}
+            raise RuntimeError(f"Lifecycle notification claim active for {incident_id}")
+        raise
+    item.update(cloudwatch_alarm_name=alarm_name, cloudwatch_alarm_state_at=state_at)
+    try:
+        _send_lifecycle_alert(item)
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET incident_alert_status = :delivered, incident_alerted_at = :at, cloudwatch_alarm_state = :state, cloudwatch_alarm_state_at = :state_at",
+            ExpressionAttributeValues={":delivered": "DELIVERED", ":at": datetime.now(timezone.utc).isoformat(), ":state": "ALARM", ":state_at": state_at},
+        )
+    except Exception as exc:
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET incident_alert_status = :failed, incident_alert_error = :error",
+            ExpressionAttributeValues={":failed": "FAILED", ":error": type(exc).__name__},
+        )
+        raise
+    return {"status": "lifecycle_notified_after_cloudwatch_alarm", "incident_id": incident_id}
+
+
+def _general_alarm_state_changed(event, state, state_at, alarm_name):
+    detail = event.get("detail", {})
+    alarm_arn = detail.get("alarmArn", alarm_name)
+    incident_id = "CWALARM-" + hashlib.sha256(alarm_arn.encode()).hexdigest()[:24].upper()
+    current = TABLE.get_item(Key={"incident_id": incident_id}, ConsistentRead=True).get("Item", {})
+    previous_state = current.get("last_notified_state")
+    previous_status = current.get("notification_status")
+    previous_at = current.get("last_notified_state_at", "")
+    if previous_state == state and previous_at == state_at and previous_status == "DELIVERED":
+        return {"status": "duplicate_alarm_state_suppressed", "incident_id": incident_id}
+    # last_notified_state is advanced only after a Slack delivery succeeds. If an
+    # OK notification itself failed, the last delivered state remains ALARM and the
+    # same OK event is allowed to retry even though notification_status is FAILED.
+    if state == "OK" and previous_state != "ALARM":
+        raise RuntimeError(f"CloudWatch OK arrived before ALARM notification was delivered for {alarm_name}; retrying")
+
+    signal = "unknown"
+    lower = alarm_name.lower()
+    for token, mapped in (("cpu", "cpu"), ("memory", "memory"), ("mem", "memory"), ("disk", "disk"), ("unhealthy", "alb_health"), ("alb", "alb_health"), ("app", "application_error"), ("error", "application_error"), ("5xx", "application_error")):
+        if token in lower:
+            signal = mapped
+            break
+    dimensions = {}
+    config = detail.get("configuration", {}) or {}
+    for metric in config.get("metrics", []) or []:
+        for dim in ((metric.get("metricStat") or {}).get("metric") or {}).get("dimensions", []) or []:
+            if dim.get("name") and dim.get("value"):
+                dimensions[dim["name"]] = dim["value"]
+    item = {
+        "incident_id": incident_id, "signal_type": signal, "alarm_name": alarm_name,
+        "cloudwatch_alarm_name": alarm_name, "alarm_arn": alarm_arn,
+        "instance_id": dimensions.get("InstanceId", ""), "environment": ENV_PREFIX,
+        "region": event.get("region", REGION), "reason": (detail.get("state") or {}).get("reason", "No state-change reason supplied."),
+        "created_at": current.get("created_at", datetime.now(timezone.utc).isoformat()),
+        "ttl": int(datetime.now(timezone.utc).timestamp()) + TTL_DAYS * 86400,
+    }
+    try:
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET signal_type = :signal, alarm_name = :alarm, cloudwatch_alarm_name = :alarm, alarm_arn = :arn, instance_id = :instance, environment = :env, region = :region, reason = :reason, created_at = if_not_exists(created_at, :created), ttl = :ttl, notification_status = :claimed, pending_state = :state, pending_state_at = :at",
+            ConditionExpression="attribute_not_exists(pending_state_at) OR pending_state_at <> :at OR notification_status = :failed",
+            ExpressionAttributeValues={":signal": signal, ":alarm": alarm_name, ":arn": alarm_arn, ":instance": item["instance_id"], ":env": ENV_PREFIX, ":region": item["region"], ":reason": item["reason"], ":created": item["created_at"], ":ttl": item["ttl"], ":claimed": "CLAIMED", ":state": state, ":at": state_at, ":failed": "FAILED"},
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            latest = TABLE.get_item(Key={"incident_id": incident_id}, ConsistentRead=True).get("Item", {})
+            if latest.get("last_notified_state") == state and latest.get("last_notified_state_at") == state_at and latest.get("notification_status") == "DELIVERED":
+                return {"status": "duplicate_alarm_state_suppressed", "incident_id": incident_id}
+            raise RuntimeError(f"Alarm notification claim active for {alarm_name}")
+        raise
+    item["incident_id"] = incident_id
+    item["cloudwatch_alarm_name"] = alarm_name
+    try:
+        _send_general_alarm_alert(item, state, state_at, item["reason"])
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET notification_status = :delivered, last_notified_state = :state, last_notified_state_at = :at, updated_at = :now REMOVE notification_error",
+            ExpressionAttributeValues={":delivered": "DELIVERED", ":state": state, ":at": state_at, ":now": datetime.now(timezone.utc).isoformat()},
+        )
+    except Exception as exc:
+        TABLE.update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression="SET notification_status = :failed, notification_error = :error",
+            ExpressionAttributeValues={":failed": "FAILED", ":error": type(exc).__name__},
+        )
+        raise
+    return {"status": "alarm_state_notified_after_cloudwatch", "incident_id": incident_id, "state": state}
+
+
 def _alarm_state_changed(event):
     """Correlate ALARM/OK transitions, suppress stale events, and notify each transition separately."""
     detail = event.get("detail", {})
     alarm_name = detail.get("alarmName", "")
     state = (detail.get("state") or {}).get("value", "")
     state_at = _iso((detail.get("state") or {}).get("timestamp") or event.get("time"))
-    match = re.search(r"-Unhealthy-Target-(INC-[A-F0-9]{24})$", alarm_name)
-    if state not in {"ALARM", "OK"} or not match:
-        LOG.info("Ignoring non-target-incident alarm state event alarm=%s state=%s", alarm_name, state)
+    if state not in {"ALARM", "OK"} or not alarm_name.startswith(f"{ENV_PREFIX}-"):
+        LOG.info("Ignoring unrelated alarm state event alarm=%s state=%s", alarm_name, state)
         return {"status": "ignored"}
 
-    incident_id = match.group(1)
+    target_match = re.search(r"-Unhealthy-Target-(INC-[A-F0-9]{24})$", alarm_name)
+    lifecycle_match = re.search(r"-Lifecycle-(LIFECYCLE-[A-F0-9]{24})$", alarm_name)
+    if lifecycle_match:
+        return _lifecycle_alarm_state_changed(event, lifecycle_match.group(1), state, state_at, alarm_name)
+    if not target_match:
+        return _general_alarm_state_changed(event, state, state_at, alarm_name)
+
+    incident_id = target_match.group(1)
     item = TABLE.get_item(Key={"incident_id": incident_id}, ConsistentRead=True).get("Item")
     if not item:
         raise RuntimeError(f"No incident record found for alarm {alarm_name} / {incident_id}")
